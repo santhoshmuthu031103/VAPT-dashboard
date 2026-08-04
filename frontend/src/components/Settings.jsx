@@ -106,6 +106,30 @@ export default function Settings({ apiBase, onStatusChange }) {
                 {status?.nmap_connected ? <ShieldCheck size={14} /> : <ShieldAlert size={14} />}
                 Nmap Scanner: {status?.nmap_mode}
               </div>
+              {status?.nuclei_mode && (
+                <div className={`badge ${status?.nuclei_mode === 'Live' ? 'badge-log' : 'badge-medium'}`}>
+                  {status?.nuclei_mode === 'Live' ? <ShieldCheck size={14} /> : <ShieldAlert size={14} />}
+                  Nuclei: {status?.nuclei_mode}
+                </div>
+              )}
+              {status?.nikto_mode && (
+                <div className={`badge ${status?.nikto_mode === 'Live' ? 'badge-log' : 'badge-medium'}`}>
+                  {status?.nikto_mode === 'Live' ? <ShieldCheck size={14} /> : <ShieldAlert size={14} />}
+                  Nikto: {status?.nikto_mode}
+                </div>
+              )}
+              {status?.zap_mode && (
+                <div className={`badge ${status?.zap_mode === 'Live' ? 'badge-log' : 'badge-medium'}`}>
+                  {status?.zap_mode === 'Live' ? <ShieldCheck size={14} /> : <ShieldAlert size={14} />}
+                  OWASP ZAP: {status?.zap_mode}
+                </div>
+              )}
+              {status?.gobuster_mode && (
+                <div className={`badge ${status?.gobuster_mode === 'Live' ? 'badge-log' : 'badge-medium'}`}>
+                  {status?.gobuster_mode === 'Live' ? <ShieldCheck size={14} /> : <ShieldAlert size={14} />}
+                  Gobuster: {status?.gobuster_mode}
+                </div>
+              )}
             </div>
           )}
         </div>
