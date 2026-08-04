@@ -1,0 +1,7 @@
+INFO:gvm_client:GVM persistent session opened.
+INFO:nmap_client:Nmap is installed and available on PATH.
+Testing get_cves WITH specific name filter:
+Got 2 CVEs, total: 1
+
+Testing get_cves WITH specific name substring filter:
+Got 6 CVEs, total: 23431
