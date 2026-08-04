@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, Target, ShieldAlert, FileText, Terminal, Settings as SettingsIcon, Shield, ShieldCheck, ShieldAlert as AlertIcon, Info } from 'lucide-react';
+import { Activity, Target, ShieldAlert, FileText, Terminal, Settings as SettingsIcon, Shield, ShieldCheck, ShieldAlert as AlertIcon, Info, Bot } from 'lucide-react';
 import Overview from './components/Overview';
 import Targets from './components/Targets';
 import Tasks from './components/Tasks';
@@ -7,6 +7,7 @@ import Reports from './components/Reports';
 import Nmap from './components/Nmap';
 import CVEs from './components/CVEs';
 import Settings from './components/Settings';
+import ToolScanners from './components/ToolScanners';
 
 // Global relative API base url
 const API_BASE = "";
@@ -61,6 +62,8 @@ export default function App() {
         return <Reports apiBase={API_BASE} activeReportId={selectedReportId} onBackToTasks={handleBackToTasks} />;
       case 'nmap':
         return <Nmap apiBase={API_BASE} />;
+      case 'toolscanners':
+        return <ToolScanners apiBase={API_BASE} />;
       case 'cves':
         return <CVEs apiBase={API_BASE} />;
       case 'settings':
@@ -131,6 +134,14 @@ export default function App() {
             onClick={() => setActiveTab('nmap')}
           >
             <Terminal size={18} /> Nmap Console
+          </button>
+
+          <button 
+            className={`btn ${activeTab === 'toolscanners' ? 'btn-primary' : 'btn-secondary'}`}
+            style={{ justifyContent: 'flex-start', border: activeTab === 'toolscanners' ? '' : '1px solid transparent' }}
+            onClick={() => setActiveTab('toolscanners')}
+          >
+            <Bot size={18} /> Tool Scanners
           </button>
 
           <button 

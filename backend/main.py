@@ -10,6 +10,11 @@ from typing import Optional, List, Dict, Any
 
 from gvm_client import GVMClient
 from nmap_client import NmapClient
+from nuclei_client import NucleiClient
+from nikto_client import NiktoClient
+from zap_client import ZAPClient
+from gobuster_client import GobusterClient
+
 # New imports for auth and additional routes
 from middleware.auth import admin_required
 
@@ -28,6 +33,10 @@ app.add_middleware(
 # Global client instances
 gvm_client = GVMClient()
 nmap_client = NmapClient()
+nuclei_client = NucleiClient()
+nikto_client = NiktoClient()
+zap_client = ZAPClient()
+gobuster_client = GobusterClient()
 
 # Request Models
 class TargetCreate(BaseModel):
@@ -64,6 +73,10 @@ def get_status():
         "nmap_connected": not nmap_client.mock_mode,
         "gvm_mode": "Live" if not gvm_client.mock_mode else "Mock Mode",
         "nmap_mode": "Live" if not nmap_client.mock_mode else "Mock Mode",
+        "nuclei_mode": "Live" if not nuclei_client.mock_mode else "Mock Mode",
+        "nikto_mode": "Live" if not nikto_client.mock_mode else "Mock Mode",
+        "zap_mode": "Live" if not zap_client.mock_mode else "Mock Mode",
+        "gobuster_mode": "Live" if not gobuster_client.mock_mode else "Mock Mode",
         "settings": {
             "connection_type": gvm_client.connection_type,
             "socket_path": gvm_client.socket_path,
@@ -93,11 +106,12 @@ def update_settings(settings: ConnectionSettings):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to apply settings: {str(e)}")
 
-# Register routers (targets, scan configs, credentials)
-from routes import target_routes, scan_config_routes, credential_routes
+# Register routers (targets, scan configs, credentials, scanners)
+from routes import target_routes, scan_config_routes, credential_routes, scanners_routes
 app.include_router(target_routes.router, prefix="/api")
 app.include_router(scan_config_routes.router, prefix="/api")
 app.include_router(credential_routes.router, prefix="/api")
+app.include_router(scanners_routes.router, prefix="/api")
 
 @app.get("/api/scanners")
 def list_scanners():
