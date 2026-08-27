@@ -1,82 +1,140 @@
-.tool-scanners-container {
+/* ToolScanners.css — Scoped component styles */
+
+/* All scanner pages use scanner-layout from index.css.
+   This file holds any additional component-specific overrides. */
+
+.scanner-config-panel {
+  position: sticky;
+  top: 0;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+}
+
+/* Form control aliases for legacy components */
+.form-control { 
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.form-control:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--violet-dim);
+}
+
+/* Card alias for legacy components */
+.card.panel {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 20px;
+}
+
+/* Dashboard view alias */
+.dashboard-view {
   display: flex;
   flex-direction: column;
 }
 
-/* Tabs */
-.scanner-tabs {
-  display: flex;
-  gap: 0.5rem;
+.dashboard-header {
+  padding: 0 0 20px;
   border-bottom: 1px solid var(--border-subtle);
-  padding-bottom: 0.5rem;
-  margin-top: 1rem;
+  margin-bottom: 20px;
 }
 
-.scanner-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--text-secondary);
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 0.95rem;
-  font-weight: 500;
-  transition: all 0.2s;
-}
-
-.scanner-tab:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+.dashboard-header h3 {
+  font-size: 16px;
+  font-weight: 700;
   color: var(--text-primary);
 }
 
-.scanner-tab.active {
-  background-color: var(--bg-darker);
-  border: 1px solid var(--border-focus);
-  color: var(--accent-cyan);
+.dashboard-header p {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
 }
 
-/* Content Area */
-.scanner-content {
-  margin-top: 1rem;
+.dashboard-content {
+  margin-top: 20px;
 }
 
-.empty-state {
-  text-align: center;
-  padding: 3rem;
+.dashboard-content h4 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}
+
+/* Error & success aliases */
+.error-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: var(--critical-dim);
+  border: 1px solid rgba(220,38,38,0.2);
+  color: #ff7b72;
+  margin: 8px 0;
+}
+
+.no-findings {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: var(--emerald-dim);
+  border: 1px solid rgba(16,185,129,0.2);
+  color: var(--emerald-400);
+}
+
+/* Spinner alias */
+.spinner {
+  animation: spin 0.8s linear infinite;
+}
+
+/* Results table alias */
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.results-table th {
+  padding: 10px 14px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--text-muted);
-  background-color: var(--bg-darker);
-  border-radius: 8px;
-  border: 1px dashed var(--border-subtle);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-elevated);
 }
 
-/* ZAP Alerts Styling */
-.zap-container {
-  display: flex;
-  flex-direction: column;
+.results-table td {
+  padding: 11px 14px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle;
 }
 
-.alerts-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 1.5rem;
+.results-table tbody tr:last-child td { border-bottom: none; }
+.results-table tbody tr:hover td {
+  background: var(--bg-base);
+  color: var(--text-primary);
 }
 
-.alert-card {
-  background-color: var(--bg-darker);
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  padding: 1.25rem;
-  display: flex;
-  flex-direction: column;
-  transition: transform 0.2s, box-shadow 0.2s;
-}
-
-.alert-card:hover {
-  transform: translateY(-2px);
-  border-color: var(--border-focus);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-}
+.break-all { word-break: break-all; }

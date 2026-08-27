@@ -1,10 +1,27 @@
 import asyncio
 import subprocess
 import logging
+import re
+import os
+import tempfile
 import xml.etree.ElementTree as ET
 from typing import AsyncGenerator, Dict, List, Any
 
 logger = logging.getLogger("nmap_client")
+
+def extract_targets(host_input: str) -> List[str]:
+    """Splits comma, newline, or whitespace separated host strings into unique cleaned host items."""
+    if not host_input:
+        return []
+    targets = [t.strip() for t in re.split(r'[\s,\n]+', str(host_input).strip()) if t.strip()]
+    # Preserve order while deduplicating
+    seen = set()
+    unique_targets = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            unique_targets.append(t)
+    return unique_targets
 
 class NmapClient:
     def __init__(self):
@@ -21,165 +38,217 @@ class NmapClient:
             logger.warning("Nmap is not installed or not in PATH. Falling back to MOCK MODE.")
             self.mock_mode = True
 
+    def _get_scan_args(self, host: str, scan_type: str) -> List[str]:
+        if scan_type == "quick":
+            return ["-F", host]
+        elif scan_type == "service":
+            return ["-sV", "-F", host]
+        elif scan_type == "os":
+            return ["-O", "-F", host]
+        elif scan_type == "full":
+            return ["-sV", "-O", "-p", "1-1000", host]
+        elif scan_type == "stealth":
+            return ["-sS", "-T2", host]
+        elif scan_type == "udp":
+            return ["-sU", "-F", host]
+        elif scan_type == "all_ports":
+            return ["-p-", "-sV", host]
+        elif scan_type == "vuln":
+            return ["-sV", "--script=vuln", host]
+        elif scan_type == "aggressive":
+            return ["-A", host]
+        else:
+            return [scan_type, host]
+
     async def scan_stream(self, host: str, scan_type: str = "quick") -> AsyncGenerator[str, None]:
         """
-        Runs an Nmap scan and streams the raw text output line-by-line.
-        If in Mock Mode, simulates the output line-by-line with standard timings.
+        Runs an Nmap scan one-by-one for each target in a target group / comma-separated list.
+        Streams the raw text output line-by-line.
         """
-        # Determine options based on scan type
-        if scan_type == "quick":
-            args = ["-F", host]
-        elif scan_type == "service":
-            args = ["-sV", "-F", host]
-        elif scan_type == "os":
-            args = ["-O", "-F", host]
-        elif scan_type == "full":
-            args = ["-sV", "-O", "-p", "1-1000", host]
-        elif scan_type == "stealth":
-            args = ["-sS", "-T2", host]
-        elif scan_type == "udp":
-            args = ["-sU", "-F", host]
-        elif scan_type == "all_ports":
-            args = ["-p-", "-sV", host]
-        elif scan_type == "vuln":
-            args = ["-sV", "--script=vuln", host]
-        elif scan_type == "aggressive":
-            args = ["-A", host]
-        else:
-            args = [scan_type, host]  # Assume direct args
+        import history_db
 
-        cmd = ["nmap"] + args
-        cmd_str = " ".join(cmd)
-
-        yield f"[VAPT-NMAP] Starting scan: {cmd_str}\n"
-
-        if self.mock_mode:
-            # Simulate real-time streaming output
-            yield "Starting Nmap 7.94 ( https://nmap.org ) at 2026-07-28 15:40 UTC\n"
-            await asyncio.sleep(0.8)
-            yield f"Nmap scan report for {host}\n"
-            await asyncio.sleep(1.0)
-            yield "Host is up (0.045s latency).\n"
-            yield "Not shown: 994 closed tcp ports (reset)\n"
-            yield "PORT     STATE SERVICE     VERSION\n"
-            await asyncio.sleep(0.5)
-            yield "22/tcp   open  ssh         OpenSSH 8.9p1 Ubuntu 3ubuntu0.1 (Ubuntu Linux; protocol 2.0)\n"
-            await asyncio.sleep(0.6)
-            yield "80/tcp   open  http        nginx 1.18.0\n"
-            await asyncio.sleep(0.4)
-            yield "443/tcp  open  ssl/http    nginx 1.18.0\n"
-            await asyncio.sleep(0.8)
-            yield "3306/tcp open  mysql       MySQL 8.0.28-0ubuntu0.20.04.3\n"
-            await asyncio.sleep(0.5)
-            yield "8080/tcp open  http-proxy  Apache Tomcat 9.0.58\n"
-            await asyncio.sleep(1.0)
-            
-            if "os" in scan_type or "full" in scan_type:
-                yield "Device type: general purpose\n"
-                yield "Running: Linux 5.X\n"
-                yield "OS CPE: cpe:/o:linux:linux_kernel:5\n"
-                yield "OS details: Linux 5.4 - 5.15\n"
-                yield "Network Distance: 1 hop\n"
-                await asyncio.sleep(0.4)
-            
-            yield "\nNmap done: 1 IP address (1 host up) scanned in 4.60 seconds\n"
+        targets = extract_targets(host)
+        if not targets:
+            yield "[VAPT-NMAP-ERROR] No valid target hosts provided.\n"
+            yield "[VAPT-NMAP-COMPLETE]\n"
             return
 
-        # Real live execution
+        total_targets = len(targets)
+        if total_targets > 1:
+            yield f"[VAPT-NMAP] Multi-target Group Scan initialized: {total_targets} hosts queued ({', '.join(targets)})\n"
+        else:
+            yield f"[VAPT-NMAP] Target Scan initialized for: {targets[0]}\n"
+
+        all_collected_ports = []
+
+        for idx, single_host in enumerate(targets, 1):
+            if total_targets > 1:
+                yield f"\n============================================================\n"
+                yield f"[VAPT-NMAP] >>> Processing Host ({idx}/{total_targets}): {single_host} <<<\n"
+                yield f"============================================================\n"
+
+            if self.mock_mode:
+                yield f"Starting Nmap 7.94 ( https://nmap.org ) at UTC\n"
+                await asyncio.sleep(0.5)
+                yield f"Nmap scan report for {single_host}\n"
+                await asyncio.sleep(0.5)
+                yield "Host is up (0.045s latency).\n"
+                yield "PORT     STATE SERVICE     VERSION\n"
+                await asyncio.sleep(0.3)
+                yield f"22/tcp   open  ssh         OpenSSH 8.9p1 Ubuntu (host: {single_host})\n"
+                await asyncio.sleep(0.3)
+                yield f"80/tcp   open  http        nginx 1.18.0 (host: {single_host})\n"
+                await asyncio.sleep(0.4)
+                yield f"\nNmap done: 1 IP address (1 host up) scanned.\n"
+
+                mock_ports = [
+                    {"host": single_host, "port": 22, "protocol": "tcp", "state": "open", "service": "ssh", "version": "OpenSSH 8.9p1 Ubuntu", "reason": "syn-ack"},
+                    {"host": single_host, "port": 80, "protocol": "tcp", "state": "open", "service": "http", "version": "nginx 1.18.0", "reason": "syn-ack"},
+                ]
+                all_collected_ports.extend(mock_ports)
+                continue
+
+            # Real execution for single_host
+            xml_file = tempfile.mktemp(suffix=f"_nmap_{idx}.xml")
+            args = self._get_scan_args(single_host, scan_type)
+            cmd = ["nmap"] + args + ["-oX", xml_file]
+            cmd_str = " ".join(["nmap"] + args)
+
+            yield f"[VAPT-NMAP] Executing: {cmd_str}\n"
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
+                )
+
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    yield line.decode("utf-8", errors="replace")
+
+                await process.wait()
+
+                # Parse XML for this host
+                if os.path.exists(xml_file):
+                    try:
+                        root = ET.parse(xml_file).getroot()
+                        for port_node in root.findall(".//port"):
+                            port_id = port_node.get("portid")
+                            protocol = port_node.get("protocol")
+                            
+                            state_node = port_node.find("state")
+                            state = state_node.get("state") if state_node is not None else "unknown"
+                            reason = state_node.get("reason") if state_node is not None else ""
+                            
+                            service_node = port_node.find("service")
+                            service = "unknown"
+                            version = ""
+                            if service_node is not None:
+                                service = service_node.get("name", "unknown")
+                                product = service_node.get("product", "")
+                                version_str = service_node.get("version", "")
+                                extrainfo = service_node.get("extrainfo", "")
+                                
+                                version_parts = [p for p in [product, version_str, extrainfo] if p]
+                                version = " ".join(version_parts) if version_parts else "N/A"
+                            
+                            all_collected_ports.append({
+                                "host": single_host,
+                                "port": int(port_id) if (port_id and port_id.isdigit()) else port_id,
+                                "protocol": protocol,
+                                "state": state,
+                                "service": service,
+                                "version": version or "N/A",
+                                "reason": reason
+                            })
+                    except Exception as e:
+                        logger.error(f"Error parsing Nmap XML for {single_host}: {e}")
+                    finally:
+                        try:
+                            os.remove(xml_file)
+                        except Exception:
+                            pass
+            except Exception as e:
+                yield f"[VAPT-NMAP-ERROR] Executing Nmap for {single_host} failed: {str(e)}\n"
+                if os.path.exists(xml_file):
+                    try:
+                        os.remove(xml_file)
+                    except Exception:
+                        pass
+
+        # Save aggregated scan history
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
-            )
-
-            while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                yield line.decode("utf-8", errors="replace")
-
-            await process.wait()
+            history_db.save_scan("nmap", host, scan_type, "completed", all_collected_ports)
         except Exception as e:
-            yield f"[VAPT-NMAP-ERROR] Executing Nmap failed: {str(e)}\n"
+            logger.error(f"Error saving nmap history: {e}")
+
+        if total_targets > 1:
+            yield f"\n[VAPT-NMAP] Scan complete: All {total_targets} group hosts finished. Total open ports found: {len(all_collected_ports)}\n"
+        
+        yield "\n[VAPT-NMAP-COMPLETE]\n"
 
     async def scan_results_parsed(self, host: str, scan_type: str = "quick") -> List[Dict[str, Any]]:
         """
-        Runs an Nmap scan with XML output enabled, parses the XML, and returns structured data.
+        Runs an Nmap scan (or multi-target group scan), parses the XML, and returns structured data.
         """
-        # Determine scan configurations
-        if scan_type == "quick":
-            args = ["-F", "-oX", "-"]
-        elif scan_type == "service":
-            args = ["-sV", "-F", "-oX", "-"]
-        elif scan_type == "os":
-            args = ["-O", "-F", "-oX", "-"]
-        elif scan_type == "full":
-            args = ["-sV", "-O", "-p", "1-1000", "-oX", "-"]
-        elif scan_type == "stealth":
-            args = ["-sS", "-T2", "-oX", "-"]
-        elif scan_type == "udp":
-            args = ["-sU", "-F", "-oX", "-"]
-        elif scan_type == "all_ports":
-            args = ["-p-", "-sV", "-oX", "-"]
-        elif scan_type == "vuln":
-            args = ["-sV", "--script=vuln", "-oX", "-"]
-        elif scan_type == "aggressive":
-            args = ["-A", "-oX", "-"]
-        else:
-            args = [scan_type, "-oX", "-"]
+        targets = extract_targets(host)
+        if not targets:
+            return []
 
-        cmd = ["nmap"] + args + [host]
+        all_ports = []
 
         if self.mock_mode:
-            # Simulated parsed result
-            ports = [
-                {"port": "22", "protocol": "tcp", "state": "open", "service": "ssh", "version": "OpenSSH 8.9p1 Ubuntu", "reason": "syn-ack"},
-                {"port": "80", "protocol": "tcp", "state": "open", "service": "http", "version": "nginx 1.18.0", "reason": "syn-ack"},
-                {"port": "443", "protocol": "tcp", "state": "open", "service": "https", "version": "nginx 1.18.0 (SSL)", "reason": "syn-ack"},
-                {"port": "3306", "protocol": "tcp", "state": "open", "service": "mysql", "version": "MySQL 8.0.28", "reason": "syn-ack"},
-                {"port": "8080", "protocol": "tcp", "state": "open", "service": "http", "version": "Apache Tomcat 9.0.58", "reason": "syn-ack"}
-            ]
-            return ports
+            for t in targets:
+                all_ports.extend([
+                    {"host": t, "port": "22", "protocol": "tcp", "state": "open", "service": "ssh", "version": "OpenSSH 8.9p1 Ubuntu", "reason": "syn-ack"},
+                    {"host": t, "port": "80", "protocol": "tcp", "state": "open", "service": "http", "version": "nginx 1.18.0", "reason": "syn-ack"},
+                    {"host": t, "port": "443", "protocol": "tcp", "state": "open", "service": "https", "version": "nginx 1.18.0 (SSL)", "reason": "syn-ack"},
+                ])
+            return all_ports
 
-        try:
-            # Runs process synchronously to grab XML buffer
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            xml_data = process.stdout.decode("utf-8", errors="replace")
-            
-            root = ET.fromstring(xml_data)
-            ports = []
-            
-            for port_node in root.findall(".//port"):
-                port_id = port_node.get("portid")
-                protocol = port_node.get("protocol")
+        for single_host in targets:
+            args = self._get_scan_args(single_host, scan_type)
+            cmd = ["nmap"] + [a for a in args if a != single_host] + ["-oX", "-", single_host]
+
+            try:
+                process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                xml_data = process.stdout.decode("utf-8", errors="replace")
                 
-                state_node = port_node.find("state")
-                state = state_node.get("state") if state_node is not None else "unknown"
-                reason = state_node.get("reason") if state_node is not None else ""
+                root = ET.fromstring(xml_data)
                 
-                service_node = port_node.find("service")
-                service = "unknown"
-                version = ""
-                if service_node is not None:
-                    service = service_node.get("name", "unknown")
-                    product = service_node.get("product", "")
-                    version_str = service_node.get("version", "")
-                    extrainfo = service_node.get("extrainfo", "")
+                for port_node in root.findall(".//port"):
+                    port_id = port_node.get("portid")
+                    protocol = port_node.get("protocol")
                     
-                    version_parts = [p for p in [product, version_str, extrainfo] if p]
-                    version = " ".join(version_parts) if version_parts else "N/A"
-                
-                ports.append({
-                    "port": port_id,
-                    "protocol": protocol,
-                    "state": state,
-                    "service": service,
-                    "version": version or "N/A",
-                    "reason": reason
-                })
-                
-            return ports
-        except Exception as e:
-            logger.error(f"Error parsing Nmap XML: {e}")
-            return []
+                    state_node = port_node.find("state")
+                    state = state_node.get("state") if state_node is not None else "unknown"
+                    reason = state_node.get("reason") if state_node is not None else ""
+                    
+                    service_node = port_node.find("service")
+                    service = "unknown"
+                    version = ""
+                    if service_node is not None:
+                        service = service_node.get("name", "unknown")
+                        product = service_node.get("product", "")
+                        version_str = service_node.get("version", "")
+                        extrainfo = service_node.get("extrainfo", "")
+                        
+                        version_parts = [p for p in [product, version_str, extrainfo] if p]
+                        version = " ".join(version_parts) if version_parts else "N/A"
+                    
+                    all_ports.append({
+                        "host": single_host,
+                        "port": port_id,
+                        "protocol": protocol,
+                        "state": state,
+                        "service": service,
+                        "version": version or "N/A",
+                        "reason": reason
+                    })
+            except Exception as e:
+                logger.error(f"Error parsing Nmap XML for {single_host}: {e}")
+
+        return all_ports

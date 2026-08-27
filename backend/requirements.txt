@@ -2,3 +2,5 @@ fastapi>=0.100.0
 uvicorn>=0.20.0
 python-gvm>=22.0.0
 xmltodict>=0.13.0
+zaproxy
+apscheduler>=3.10.0

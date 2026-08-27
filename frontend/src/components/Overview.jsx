@@ -1,333 +1,336 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Shield, ShieldAlert, ShieldX, CheckCircle2, Activity, Users, AlertCircle, RefreshCw, Terminal, ArrowUpRight } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  Activity, Target, CheckCircle2, XCircle, ArrowRight,
+  Shield, Globe, ScanSearch, Zap, Terminal, RefreshCw,
+  TrendingUp, AlertTriangle, Clock
+} from 'lucide-react';
 
-export default function Overview({ apiBase, onTabChange, onSelectReport }) {
-  const [tasks, setTasks] = useState([]);
-  const [targets, setTargets] = useState([]);
-  // Keep status in a ref so switching tabs does NOT reset it to null (fixes flicker)
-  const [status, setStatus] = useState(() => {
-    try { return JSON.parse(sessionStorage.getItem('vapt_status') || 'null'); } catch { return null; }
-  });
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+const QUICK_SCANNERS = [
+  { id: 'nmap',     label: 'Nmap',     icon: Terminal,   color: '#7c3aed', desc: 'Port scanner' },
+  { id: 'nuclei',   label: 'Nuclei',   icon: Shield,     color: '#10b981', desc: 'Vuln templates' },
+  { id: 'nikto',    label: 'Nikto',    icon: ScanSearch, color: '#d97706', desc: 'Web server audit' },
+  { id: 'gobuster', label: 'Gobuster', icon: Globe,      color: '#2563eb', desc: 'Dir brute-force' },
+  { id: 'zap',      label: 'OWASP ZAP',icon: Zap,        color: '#dc2626', desc: 'DAST scanner' },
+];
 
-  // Aggregated vulnerabilities from completed reports
-  const [vulnerabilityAggregate, setVulnerabilityAggregate] = useState({
-    high: 0,
-    medium: 0,
-    low: 0,
-    log: 0,
-    total: 0
-  });
-  const [recentFindings, setRecentFindings] = useState([]);
-  const [loadingVulnerabilities, setLoadingVulnerabilities] = useState(false);
+const STATUS_COLOR = {
+  'Done':      { color: '#10b981', bg: 'rgba(16,185,129,0.1)' },
+  'Running':   { color: '#7c3aed', bg: 'rgba(124,58,237,0.1)' },
+  'Requested': { color: '#d97706', bg: 'rgba(217,119,6,0.1)'  },
+  'Stopped':   { color: '#dc2626', bg: 'rgba(220,38,38,0.1)'  },
+};
 
-  const fetchDashboardData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [tasksRes, targetsRes, statusRes] = await Promise.all([
-        fetch(`${apiBase}/api/tasks`),
-        fetch(`${apiBase}/api/targets`),
-        fetch(`${apiBase}/api/status`)
-      ]);
-
-      if (!tasksRes.ok || !targetsRes.ok || !statusRes.ok) {
-        throw new Error('Failed to synchronize dashboard telemetry.');
-      }
-
-      const tasksData = await tasksRes.json();
-      const targetsData = await targetsRes.json();
-      const statusData = await statusRes.json();
-
-      setTasks(tasksData.tasks || []);
-      setTargets(targetsData);
-      setStatus(statusData);
-      // Persist status so tab-switch doesn't flash 'Offline'
-      try { sessionStorage.setItem('vapt_status', JSON.stringify(statusData)); } catch {}
-
-      // Now aggregate report metrics from completed tasks
-      const completedTasks = (tasksData.tasks || []).filter(t => t.status?.toLowerCase() === 'done' && t.report_id);
-      if (completedTasks.length > 0) {
-        aggregateVulnerabilities(completedTasks);
-      }
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const aggregateVulnerabilities = async (completedTasks) => {
-    setLoadingVulnerabilities(true);
-    let high = 0, medium = 0, low = 0, log = 0, total = 0;
-    const allFindings = [];
-
-    try {
-      // Limit to fetching reports for the 5 most recent completed tasks to avoid overload
-      const tasksToFetch = completedTasks.slice(0, 5);
-      const reportPromises = tasksToFetch.map(t => 
-        fetch(`${apiBase}/api/reports/${t.report_id}`).then(res => res.ok ? res.json() : null)
-      );
-
-      const reports = await Promise.all(reportPromises);
-      reports.forEach((rep, index) => {
-        if (!rep) return;
-        const taskName = tasksToFetch[index].name;
-        const reportId = tasksToFetch[index].report_id;
-        
-        // Sum counts
-        high += rep.summary.high || 0;
-        medium += rep.summary.medium || 0;
-        low += rep.summary.low || 0;
-        log += rep.summary.log || 0;
-        total += rep.summary.total || 0;
-
-        // Compile findings for recent findings table
-        if (rep.vulnerabilities) {
-          rep.vulnerabilities.forEach(v => {
-            allFindings.push({
-              ...v,
-              taskName,
-              reportId
-            });
-          });
-        }
-      });
-
-      setVulnerabilityAggregate({ high, medium, low, log, total });
-      
-      // Sort findings by severity and CVSS (highest first)
-      const sortedFindings = allFindings.sort((a, b) => b.cvss - a.cvss);
-      setRecentFindings(sortedFindings.slice(0, 5)); // Keep top 5 threats
-    } catch (err) {
-      console.error("Error aggregating vulnerabilities: ", err);
-    } finally {
-      setLoadingVulnerabilities(false);
-    }
-  };
-
+function useInterval(fn, delay) {
+  const savedFn = useRef(fn);
+  useEffect(() => { savedFn.current = fn; }, [fn]);
   useEffect(() => {
-    fetchDashboardData();
-  }, []);
+    if (delay === null) return;
+    const id = setInterval(() => savedFn.current(), delay);
+    return () => clearInterval(id);
+  }, [delay]);
+}
 
-  const activeScansCount = tasks.filter(t => t.status?.toLowerCase() === 'running').length;
-  const readyTasksCount = tasks.filter(t => t.status?.toLowerCase() === 'new').length;
+function StatCard({ label, value, sub, color, icon: Icon, loading }) {
+  return (
+    <div className="stat-card">
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+        <span className="stat-label">{label}</span>
+        <div style={{ width: 34, height: 34, borderRadius: 8, background: `${color}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+          <Icon size={16} style={{ color }} />
+        </div>
+      </div>
+      {loading
+        ? <div className="skeleton" style={{ height: 36, width: '60%', marginTop: 4 }} />
+        : <div className="stat-value" style={{ color }} key={value}>{value ?? '—'}</div>
+      }
+      <div className="stat-sub">{sub}</div>
+    </div>
+  );
+}
+
+function TaskStatusBadge({ status }) {
+  const s = STATUS_COLOR[status] || { color: 'var(--text-muted)', bg: 'rgba(255,255,255,0.05)' };
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5,
+      padding: '2px 8px', borderRadius: 20,
+      background: s.bg, color: s.color,
+      fontSize: 11, fontWeight: 700,
+    }}>
+      {status === 'Running' && (
+        <span style={{ width: 5, height: 5, borderRadius: '50%', background: s.color, animation: 'ring-pulse 1.5s ease-in-out infinite', display: 'inline-block' }} />
+      )}
+      {status}
+    </span>
+  );
+}
+
+export default function Overview({ apiBase, onTabChange }) {
+  const [tasks, setTasks]     = useState([]);
+  const [targets, setTargets] = useState([]);
+  const [status, setStatus]   = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [refreshing, setRefreshing]   = useState(false);
+
+  const fetchAll = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    else setRefreshing(true);
+    try {
+      const [tRes, tgRes, sRes] = await Promise.all([
+        fetch(`${apiBase}/api/tasks?page=1&limit=100`),
+        fetch(`${apiBase}/api/targets`),
+        fetch(`${apiBase}/api/status`),
+      ]);
+      if (tRes.ok)  { const d = await tRes.json();  setTasks(d.tasks || d || []); }
+      if (tgRes.ok) { setTargets(await tgRes.json()); }
+      if (sRes.ok)  { setStatus(await sRes.json()); }
+      setLastUpdated(new Date());
+    } catch (_) {}
+    finally { setLoading(false); setRefreshing(false); }
+  }, [apiBase]);
+
+  useEffect(() => { fetchAll(); }, [fetchAll]);
+  // Live-poll every 10 seconds
+  useInterval(() => fetchAll(true), 10000);
+
+  const taskList     = Array.isArray(tasks) ? tasks : (tasks.tasks || []);
+  const running      = taskList.filter(t => t.status === 'Running').length;
+  const done         = taskList.filter(t => t.status === 'Done').length;
+  const recentTasks  = [...taskList].sort((a, b) => (b.last_change || '') > (a.last_change || '') ? 1 : -1).slice(0, 8);
+
+  const SYSTEM_TOOLS = [
+    { label: 'OpenVAS GVM', key: 'gvm_connected',      mode: status?.gvm_mode },
+    { label: 'OWASP ZAP',  key: 'zap_mode',            isMode: true },
+    { label: 'Nuclei',     key: 'nuclei_mode',          isMode: true },
+    { label: 'Gobuster',   key: 'gobuster_mode',        isMode: true },
+    { label: 'Nikto',      key: 'nikto_mode',           isMode: true },
+    { label: 'Nmap',       key: 'nmap_mode',            isMode: true },
+  ].map(t => ({
+    ...t,
+    online: t.isMode
+      ? (status?.[t.key] && status[t.key] === 'Live')
+      : !!status?.[t.key],
+  }));
+
+  const timeAgo = lastUpdated
+    ? Math.round((Date.now() - lastUpdated.getTime()) / 1000)
+    : null;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h2 style={{ fontSize: '1.8rem', marginBottom: '0.5rem' }}>Shield Security Command</h2>
-          <p>Real-time security auditing dashboard. Monitor open vulnerabilities, targets, and scan operations.</p>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+
+      {/* ── Live Header Strip ── */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        flexWrap: 'wrap', gap: 10,
+        padding: '10px 16px',
+        background: 'rgba(16,185,129,0.04)',
+        border: '1px solid rgba(16,185,129,0.12)',
+        borderRadius: 8,
+      }}>
+        <div className="live-indicator">
+          <span className="live-dot" />
+          Live Dashboard
         </div>
-        <button className="btn btn-secondary" onClick={fetchDashboardData} disabled={loading}>
-          <RefreshCw size={16} className={loading ? 'animate-spin-slow' : ''} /> Sync Telemetry
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {timeAgo !== null && (
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Clock size={11} />
+              Updated {timeAgo}s ago
+            </span>
+          )}
+          <button
+            className="btn btn-ghost btn-sm btn-icon"
+            onClick={() => fetchAll(true)}
+            disabled={refreshing}
+            title="Refresh now"
+          >
+            <RefreshCw size={13} style={{ animation: refreshing ? 'spin 0.8s linear infinite' : 'none' }} />
+          </button>
+        </div>
       </div>
 
-      {error && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '2.5rem', border: '1px solid var(--severity-high)', borderRadius: '8px', backgroundColor: 'var(--severity-high-dim)' }}>
-          <AlertCircle size={28} style={{ color: 'var(--severity-high)' }} />
-          <div>
-            <h4 style={{ color: 'var(--severity-high)', fontSize: '1.1rem' }}>Telemetry Sync Failed</h4>
-            <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>{error}</p>
+      {/* ── Stat Cards ── */}
+      <div className="grid-4">
+        <StatCard label="Total Targets"    value={targets.length}  sub="Registered hosts"         color="var(--violet-400)"   icon={Target}      loading={loading} />
+        <StatCard label="Total Scans"      value={taskList.length} sub={`${running} running now`} color="var(--medium)"       icon={Activity}    loading={loading} />
+        <StatCard label="Completed"        value={done}            sub="Ready for review"          color="var(--emerald-500)"  icon={CheckCircle2} loading={loading} />
+        <StatCard label="Active Threats"   value={running > 0 ? running : 'None'} sub="Currently running scans" color={running > 0 ? 'var(--violet-300)' : 'var(--text-muted)'} icon={AlertTriangle} loading={loading} />
+      </div>
+
+      {/* ── Main Grid ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: 20 }}>
+
+        {/* Recent Scans */}
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">
+              <Activity size={14} style={{ color: 'var(--violet-300)' }} />
+              Audit Scan Activity
+              {running > 0 && (
+                <span style={{ marginLeft: 6 }} className="live-indicator">
+                  <span className="live-dot" style={{ width: 5, height: 5 }} />
+                  {running} running
+                </span>
+              )}
+            </span>
+            <button className="btn btn-ghost btn-sm" onClick={() => onTabChange?.('tasks')} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+              View all <ArrowRight size={12} />
+            </button>
+          </div>
+          {loading ? (
+            <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {[...Array(4)].map((_, i) => (
+                <div key={i} className="skeleton" style={{ height: 20, width: `${70 + Math.random() * 20}%` }} />
+              ))}
+            </div>
+          ) : recentTasks.length === 0 ? (
+            <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+              No scans yet.{' '}
+              <button className="btn btn-ghost btn-sm" onClick={() => onTabChange?.('tasks')} style={{ color: 'var(--violet-300)', padding: '0 4px' }}>
+                Create one →
+              </button>
+            </div>
+          ) : (
+            <div className="fade-in">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Scan Name</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th>Last Changed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recentTasks.map((t, i) => (
+                    <tr key={t.id || i}>
+                      <td style={{ fontWeight: 500, color: 'var(--text-primary)' }}>{t.name}</td>
+                      <td><TaskStatusBadge status={t.status} /></td>
+                      <td>
+                        {t.status === 'Running' ? (
+                          <div className="progress-bar-wrap" style={{ width: 80 }}>
+                            <div className="progress-bar" />
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                            {t.status === 'Done' ? '100%' : '—'}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ color: 'var(--text-muted)', fontSize: 12 }}>{t.last_change || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {/* Right Column */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+          {/* System Health */}
+          <div className="card">
+            <div className="card-header">
+              <span className="card-title">
+                <TrendingUp size={14} style={{ color: 'var(--violet-300)' }} />
+                System Health
+              </span>
+              {status && (
+                <span className="live-indicator" style={{ fontSize: 10 }}>
+                  <span className="live-dot" style={{ width: 5, height: 5 }} />
+                  Live
+                </span>
+              )}
+            </div>
+            <div className="card-body" style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {loading
+                ? [...Array(6)].map((_, i) => <div key={i} className="skeleton" style={{ height: 16, width: '80%' }} />)
+                : SYSTEM_TOOLS.map(tool => (
+                  <div key={tool.label} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                    <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{tool.label}</span>
+                    <span className={`tool-badge ${tool.online ? 'live' : 'offline'}`}>
+                      {tool.online
+                        ? <><span style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--emerald-500)', display: 'inline-block', animation: 'ring-pulse 2s ease-in-out infinite' }} /> Live</>
+                        : <><XCircle size={10} /> Offline</>
+                      }
+                    </span>
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+
+          {/* Quick Launch */}
+          <div className="card">
+            <div className="card-header">
+              <span className="card-title">
+                <Zap size={14} style={{ color: 'var(--violet-300)' }} />
+                Quick Launch
+              </span>
+            </div>
+            <div className="card-body" style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {QUICK_SCANNERS.map(s => {
+                const Icon = s.icon;
+                return (
+                  <button
+                    key={s.id}
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => onTabChange?.(s.id)}
+                    style={{ justifyContent: 'flex-start', gap: 8, border: '1px solid transparent', transition: 'all 0.15s' }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = s.color + '60'}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = 'transparent'}
+                  >
+                    <div style={{ width: 22, height: 22, borderRadius: 5, background: s.color + '20', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <Icon size={12} style={{ color: s.color }} />
+                    </div>
+                    <span style={{ fontWeight: 500 }}>{s.label}</span>
+                    <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 10 }}>{s.desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+
+      {/* ── Targets Grid ── */}
+      {targets.length > 0 && (
+        <div className="card fade-in">
+          <div className="card-header">
+            <span className="card-title">
+              <Target size={14} style={{ color: 'var(--violet-300)' }} />
+              Registered Targets
+            </span>
+            <button className="btn btn-ghost btn-sm" onClick={() => onTabChange?.('targets')} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+              Manage <ArrowRight size={12} />
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10, padding: 14 }}>
+            {targets.map(t => (
+              <div key={t.id} style={{
+                padding: '10px 14px',
+                borderRadius: 7,
+                border: '1px solid var(--border-subtle)',
+                background: 'var(--bg-elevated)',
+                display: 'flex', flexDirection: 'column', gap: 3,
+                transition: 'border-color 0.15s',
+                cursor: 'default',
+              }}
+                onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet-500)'}
+                onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border-subtle)'}
+              >
+                <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>{t.name}</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--violet-300)' }}>{t.hosts}</div>
+              </div>
+            ))}
           </div>
         </div>
       )}
-
-      {/* Main KPI Counters */}
-      <div className="grid-dashboard">
-        <div className="panel" style={{ display: 'flex', gap: '1.25rem', alignItems: 'center' }}>
-          <div style={{ padding: '0.75rem', borderRadius: '8px', backgroundColor: 'var(--accent-cyan-dim)' }}>
-            <Activity size={28} style={{ color: 'var(--accent-cyan)' }} />
-          </div>
-          <div>
-            <span className="text-secondary" style={{ fontSize: '0.85rem', textTransform: 'uppercase', fontWeight: 600 }}>Active Scans</span>
-            <h3 style={{ fontSize: '2rem', marginTop: '0.2rem' }}>{activeScansCount}</h3>
-          </div>
-        </div>
-
-        <div className="panel" style={{ display: 'flex', gap: '1.25rem', alignItems: 'center' }}>
-          <div style={{ padding: '0.75rem', borderRadius: '8px', backgroundColor: 'rgba(255, 255, 255, 0.05)' }}>
-            <Shield size={28} className="text-secondary" />
-          </div>
-          <div>
-            <span className="text-secondary" style={{ fontSize: '0.85rem', textTransform: 'uppercase', fontWeight: 600 }}>Deployed Audits</span>
-            <h3 style={{ fontSize: '2rem', marginTop: '0.2rem' }}>{tasks.length}</h3>
-          </div>
-        </div>
-
-        <div className="panel" style={{ display: 'flex', gap: '1.25rem', alignItems: 'center' }}>
-          <div style={{ padding: '0.75rem', borderRadius: '8px', backgroundColor: 'rgba(255, 255, 255, 0.05)' }}>
-            <Users size={28} className="text-secondary" />
-          </div>
-          <div>
-            <span className="text-secondary" style={{ fontSize: '0.85rem', textTransform: 'uppercase', fontWeight: 600 }}>Scope Targets</span>
-            <h3 style={{ fontSize: '2rem', marginTop: '0.2rem' }}>{targets.length}</h3>
-          </div>
-        </div>
-
-        <div className="panel" style={{ display: 'flex', gap: '1.25rem', alignItems: 'center' }}>
-          <div style={{ padding: '0.75rem', borderRadius: '8px', backgroundColor: status?.gvm_connected ? 'var(--severity-log-dim)' : 'var(--severity-high-dim)' }}>
-            <CheckCircle2 size={28} style={{ color: status?.gvm_connected ? 'var(--severity-log)' : 'var(--severity-high)' }} />
-          </div>
-          <div>
-            <span className="text-secondary" style={{ fontSize: '0.85rem', textTransform: 'uppercase', fontWeight: 600 }}>Scanner Connect</span>
-            <h3 style={{ fontSize: '1.25rem', marginTop: '0.4rem', color: status?.gvm_connected ? 'var(--severity-log)' : 'var(--severity-high)' }}>
-              {status?.gvm_connected ? 'Online' : 'Offline / Mock'}
-            </h3>
-          </div>
-        </div>
-      </div>
-
-      {/* Aggregate Threat Metrics Card */}
-      <div className="panel">
-        <h3 style={{ marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <ShieldAlert size={20} className="text-secondary" /> Unified Network Vulnerability Posture
-        </h3>
-        {loadingVulnerabilities ? (
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem', gap: '0.5rem' }}>
-            <RefreshCw size={24} className="animate-spin-slow text-muted" />
-            <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Calculating risk profiles...</span>
-          </div>
-        ) : vulnerabilityAggregate.total === 0 ? (
-          <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-            No vulnerability data compiled. Run an audit task in the <span style={{ textDecoration: 'underline', cursor: 'pointer', color: 'var(--accent-cyan)' }} onClick={() => onTabChange('tasks')}>Audits Tab</span> to view risks.
-          </div>
-        ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1.5rem' }}>
-            <div style={{ padding: '1rem', borderRadius: '8px', background: 'var(--severity-high-dim)', border: '1px solid rgba(248, 113, 113, 0.15)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: 'var(--severity-high)' }}>
-                <span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>HIGH SEVERITY</span>
-                <ShieldX size={16} />
-              </div>
-              <h2 style={{ fontSize: '2.5rem', marginTop: '0.5rem', color: 'var(--severity-high)' }}>{vulnerabilityAggregate.high}</h2>
-            </div>
-            
-            <div style={{ padding: '1rem', borderRadius: '8px', background: 'var(--severity-medium-dim)', border: '1px solid rgba(251, 191, 36, 0.15)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: 'var(--severity-medium)' }}>
-                <span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>MEDIUM SEVERITY</span>
-                <ShieldAlert size={16} />
-              </div>
-              <h2 style={{ fontSize: '2.5rem', marginTop: '0.5rem', color: 'var(--severity-medium)' }}>{vulnerabilityAggregate.medium}</h2>
-            </div>
-
-            <div style={{ padding: '1rem', borderRadius: '8px', background: 'var(--severity-low-dim)', border: '1px solid rgba(96, 165, 250, 0.15)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: 'var(--severity-low)' }}>
-                <span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>LOW SEVERITY</span>
-                <Shield size={16} />
-              </div>
-              <h2 style={{ fontSize: '2.5rem', marginTop: '0.5rem', color: 'var(--severity-low)' }}>{vulnerabilityAggregate.low}</h2>
-            </div>
-
-            <div style={{ padding: '1rem', borderRadius: '8px', background: 'var(--severity-log-dim)', border: '1px solid rgba(52, 211, 153, 0.15)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: 'var(--severity-log)' }}>
-                <span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>LOG FINDINGS</span>
-                <CheckCircle2 size={16} />
-              </div>
-              <h2 style={{ fontSize: '2.5rem', marginTop: '0.5rem', color: 'var(--severity-log)' }}>{vulnerabilityAggregate.log}</h2>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Two Column Layout: Recent Scans + High Risk Alerts */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: '1.5rem' }}>
-        
-        {/* Recent Scan Tasks */}
-        <div className="panel" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h3>Recent Audit Scans</h3>
-            <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => onTabChange('tasks')}>
-              Manage <ArrowUpRight size={12} />
-            </button>
-          </div>
-
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Audit Scan</th>
-                  <th>Target</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tasks.slice(0, 4).map((task) => (
-                  <tr key={task.id}>
-                    <td>
-                      <div style={{ fontWeight: 500, color: 'var(--text-primary)' }}>{task.name}</div>
-                    </td>
-                    <td><code style={{ fontSize: '0.8rem', color: 'var(--accent-cyan)' }}>{task.target_hosts}</code></td>
-                    <td>
-                      <span className={`badge ${task.status?.toLowerCase() === 'done' ? 'badge-log' : task.status?.toLowerCase() === 'running' ? 'badge-cyan animate-pulse-slow' : 'badge-low'}`} style={{ fontSize: '0.65rem', padding: '0.15rem 0.4rem' }}>
-                        {task.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-                {tasks.length === 0 && (
-                  <tr>
-                    <td colSpan="3" style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem', padding: '2rem' }}>
-                      No scan configurations deployed.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* High Risk Critical Threats */}
-        <div className="panel" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h3>High Risk Threats Identified</h3>
-            <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => onTabChange('reports')}>
-              Reports <ArrowUpRight size={12} />
-            </button>
-          </div>
-
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Threat / Vulnerability</th>
-                  <th>Severity</th>
-                  <th>CVSS</th>
-                  <th>Host Info</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentFindings.map((finding, idx) => (
-                  <tr key={idx} style={{ cursor: 'pointer' }} onClick={() => onSelectReport(finding.reportId)}>
-                    <td>
-                      <div style={{ fontWeight: 500, color: 'var(--text-primary)', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', maxWidth: '240px' }} title={finding.name}>
-                        {finding.name}
-                      </div>
-                    </td>
-                    <td>
-                      <span className={`badge ${finding.severity.toLowerCase() === 'high' ? 'badge-high' : 'badge-medium'}`} style={{ fontSize: '0.65rem', padding: '0.15rem 0.4rem' }}>
-                        {finding.severity}
-                      </span>
-                    </td>
-                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', fontWeight: 'bold' }}>{finding.cvss}</td>
-                    <td><code style={{ fontSize: '0.8rem' }}>Port {finding.port}</code></td>
-                  </tr>
-                ))}
-                {recentFindings.length === 0 && (
-                  <tr>
-                    <td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem', padding: '2rem' }}>
-                      No critical threat vectors recorded.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-      </div>
     </div>
   );
 }

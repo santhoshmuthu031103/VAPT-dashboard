@@ -2,9 +2,22 @@ import asyncio
 import subprocess
 import logging
 import json
+import re
 from typing import AsyncGenerator, Dict, List, Any
 
 logger = logging.getLogger("nuclei_client")
+
+def extract_targets(host_input: str) -> List[str]:
+    if not host_input:
+        return []
+    targets = [t.strip() for t in re.split(r'[\s,\n]+', str(host_input).strip()) if t.strip()]
+    seen = set()
+    unique = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique
 
 class NucleiClient:
     def __init__(self):
@@ -22,111 +35,153 @@ class NucleiClient:
 
     async def scan_stream(self, host: str, templates: str = "") -> AsyncGenerator[str, None]:
         """
-        Runs a Nuclei scan and streams the raw text output line-by-line.
+        Runs Nuclei scans one-by-one sequentially for each host/URL in a target group.
+        Streams raw text output line-by-line.
         """
-        cmd = ["nuclei", "-u", host]
-        if templates:
-            cmd.extend(["-t", templates])
-            
-        cmd_str = " ".join(cmd)
-        yield f"[VAPT-NUCLEI] Starting scan: {cmd_str}\n"
-
-        if self.mock_mode:
-            yield f"                     __     _\n"
-            yield f"   ____  __  _______/ /__  (_)\n"
-            yield f"  / __ \\/ / / / ___/ / _ \\/ /\n"
-            yield f" / / / / /_/ / /__/ /  __/ /\n"
-            yield f"/_/ /_/\\__,_/\\___/_/\\___/_/\n"
-            yield f"\n"
-            yield f"[WRN] Use with caution. You are responsible for your actions.\n"
-            yield f"[INF] Using Nuclei Engine 3.1.0 (built: 2026-01-01)\n"
-            await asyncio.sleep(1.0)
-            yield f"[INF] Templates loaded for current scan: 6542\n"
-            await asyncio.sleep(1.5)
-            
-            # Simulate finding some vulnerabilities
-            yield f"[tech-detect] [http] [info] {host} (nginx)\n"
-            await asyncio.sleep(0.5)
-            yield f"[ssl-dns-names] [ssl] [info] {host} (*.example.com)\n"
-            await asyncio.sleep(1.2)
-            yield f"[CVE-2021-41773] [http] [high] {host} (Apache Path Traversal)\n"
-            await asyncio.sleep(0.8)
-            yield f"[exposed-panels] [http] [low] {host}/admin/login.php\n"
-            await asyncio.sleep(2.0)
-            yield f"[INF] Scan results written to output file\n"
+        targets = extract_targets(host)
+        if not targets:
+            yield "[VAPT-NUCLEI-ERROR] No valid targets specified.\n"
+            yield "[VAPT-NUCLEI-COMPLETE]\n"
             return
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
-            )
+        total_targets = len(targets)
+        if total_targets > 1:
+            yield f"[VAPT-NUCLEI] Multi-target Group Scan initialized: {total_targets} hosts queued ({', '.join(targets)})\n"
+        else:
+            yield f"[VAPT-NUCLEI] Target Scan initialized for: {targets[0]}\n"
 
-            while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                yield line.decode("utf-8", errors="replace")
+        for idx, single_host in enumerate(targets, 1):
+            target_url = f"http://{single_host}" if not single_host.startswith("http") else single_host
 
-            await process.wait()
-        except Exception as e:
-            yield f"[VAPT-NUCLEI-ERROR] Executing Nuclei failed: {str(e)}\n"
+            if total_targets > 1:
+                yield f"\n============================================================\n"
+                yield f"[VAPT-NUCLEI] >>> Processing Host ({idx}/{total_targets}): {single_host} <<<\n"
+                yield f"============================================================\n"
 
-    async def scan_results_parsed(self, host: str, templates: str = "") -> List[Dict[str, Any]]:
+            cmd = ["nuclei", "-u", target_url]
+            if templates:
+                cmd.extend(["-t", templates])
+                
+            cmd_str = " ".join(cmd)
+            yield f"[VAPT-NUCLEI] Starting scan: {cmd_str}\n"
+
+            if self.mock_mode:
+                yield f"[INF] Using Nuclei Engine for {single_host}\n"
+                await asyncio.sleep(0.5)
+                yield f"[tech-detect] [http] [info] {target_url} (nginx)\n"
+                await asyncio.sleep(0.5)
+                yield f"[exposed-panels] [http] [low] {target_url}/admin/login.php\n"
+                await asyncio.sleep(0.5)
+                yield f"[INF] Scan completed for {single_host}\n"
+                continue
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
+                )
+
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    yield line.decode("utf-8", errors="replace")
+
+                await process.wait()
+            except Exception as e:
+                yield f"[VAPT-NUCLEI-ERROR] Executing Nuclei on {single_host} failed: {str(e)}\n"
+
+        if total_targets > 1:
+            yield f"\n[VAPT-NUCLEI] Group Scan finished: All {total_targets} hosts scanned successfully.\n"
+        
+        yield "\n[VAPT-NUCLEI-COMPLETE]\n"
+
+    async def scan_results_parsed(self, host: str, templates: str = "", category: str = "all",
+                                   severity: str = "info", rate_limit: int = 150,
+                                   concurrency: int = 25, timeout: int = 5,
+                                   custom_tags: str = None) -> List[Dict[str, Any]]:
         """
-        Runs Nuclei with JSONL output, parses it, and returns structured vulnerabilities.
+        Runs Nuclei with JSONL output sequentially for each target in a target group,
+        parses the results, and returns structured vulnerabilities.
         """
-        cmd = ["nuclei", "-u", host, "-jsonl"]
-        if templates:
-            cmd.extend(["-t", templates])
+        targets = extract_targets(host)
+        if not targets:
+            return []
+
+        all_results = []
+
+        # Severity filter
+        severity_map = {
+            "info": "info,low,medium,high,critical",
+            "low": "low,medium,high,critical",
+            "medium": "medium,high,critical",
+            "high": "high,critical",
+            "critical": "critical"
+        }
+        sev_str = severity_map.get(severity, "info,low,medium,high,critical")
 
         if self.mock_mode:
-            # Simulated parsed result
-            await asyncio.sleep(2.0)
-            return [
-                {
-                    "template-id": "tech-detect",
-                    "info": {"name": "Wappalyzer Technology Detection", "severity": "info"},
-                    "type": "http",
-                    "host": host,
-                    "matched-at": f"http://{host}",
-                    "extracted-results": ["nginx"]
-                },
-                {
-                    "template-id": "CVE-2021-41773",
-                    "info": {"name": "Apache 2.4.49 - Path Traversal", "severity": "high"},
-                    "type": "http",
-                    "host": host,
-                    "matched-at": f"http://{host}/cgi-bin/.%2e/.%2e/.%2e/.%2e/etc/passwd"
-                },
-                {
-                    "template-id": "exposed-panels",
-                    "info": {"name": "Exposed Login Panel", "severity": "low"},
-                    "type": "http",
-                    "host": host,
-                    "matched-at": f"http://{host}/admin/login.php"
-                }
-            ]
+            await asyncio.sleep(1.0)
+            for t in targets:
+                all_results.extend([
+                    {
+                        "template-id": "tech-detect",
+                        "info": {"name": "Wappalyzer Technology Detection", "severity": "info"},
+                        "type": "http",
+                        "host": t,
+                        "matched-at": f"http://{t}",
+                        "extracted-results": ["nginx"]
+                    },
+                    {
+                        "template-id": "exposed-panels",
+                        "info": {"name": "Exposed Login Panel", "severity": "low"},
+                        "type": "http",
+                        "host": t,
+                        "matched-at": f"http://{t}/admin/login.php"
+                    }
+                ])
+            return all_results
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, _ = await process.communicate()
-            
-            results = []
-            for line in stdout.decode("utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    results.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-            return results
-        except Exception as e:
-            logger.error(f"Error executing Nuclei JSON: {e}")
-            return []
+        for single_host in targets:
+            target_url = f"http://{single_host}" if not single_host.startswith("http") else single_host
+            cmd = ["nuclei", "-u", target_url, "-jsonl",
+                   "-rl", str(rate_limit),
+                   "-c", str(concurrency),
+                   "-timeout", str(timeout),
+                   "-severity", sev_str]
+
+            if templates:
+                cmd.extend(["-t", templates])
+
+            if custom_tags:
+                cmd.extend(["-tags", custom_tags])
+            elif category != "all":
+                if category == "vulnerability":
+                    cmd.extend(["-tags", "vulnerability,vuln"])
+                else:
+                    cmd.extend(["-tags", category])
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                stdout, _ = await process.communicate()
+                
+                for line in stdout.decode("utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        item = json.loads(line)
+                        if "host" not in item or not item["host"]:
+                            item["host"] = single_host
+                        all_results.append(item)
+                    except json.JSONDecodeError:
+                        pass
+            except Exception as e:
+                logger.error(f"Error executing Nuclei JSON for {single_host}: {e}")
+
+        return all_results

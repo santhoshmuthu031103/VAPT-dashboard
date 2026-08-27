@@ -3,7 +3,7 @@ import asyncio
 import pdfkit
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -14,9 +14,16 @@ from nuclei_client import NucleiClient
 from nikto_client import NiktoClient
 from zap_client import ZAPClient
 from gobuster_client import GobusterClient
+from sqlmap_client import SqlmapClient
+from ffuf_client import FfufClient
 
 # New imports for auth and additional routes
 from middleware.auth import admin_required
+import history_db
+import scheduler
+
+# Initialize scan history database
+history_db.init_db()
 
 
 app = FastAPI(title="VAPT Dashboard Server", description="Backend APIs for orchestrating OpenVAS & Nmap scans")
@@ -28,6 +35,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Global client instances
@@ -37,6 +45,8 @@ nuclei_client = NucleiClient()
 nikto_client = NiktoClient()
 zap_client = ZAPClient()
 gobuster_client = GobusterClient()
+sqlmap_client = SqlmapClient()
+ffuf_client = FfufClient()
 
 # Request Models
 class TargetCreate(BaseModel):
@@ -77,6 +87,8 @@ def get_status():
         "nikto_mode": "Live" if not nikto_client.mock_mode else "Mock Mode",
         "zap_mode": "Live" if not zap_client.mock_mode else "Mock Mode",
         "gobuster_mode": "Live" if not gobuster_client.mock_mode else "Mock Mode",
+        "sqlmap_mode": "Live" if not sqlmap_client.mock_mode else "Mock Mode",
+        "ffuf_mode": "Live" if not ffuf_client.mock_mode else "Mock Mode",
         "settings": {
             "connection_type": gvm_client.connection_type,
             "socket_path": gvm_client.socket_path,
@@ -107,11 +119,22 @@ def update_settings(settings: ConnectionSettings):
         raise HTTPException(status_code=500, detail=f"Failed to apply settings: {str(e)}")
 
 # Register routers (targets, scan configs, credentials, scanners)
-from routes import target_routes, scan_config_routes, credential_routes, scanners_routes
+from routes import target_routes, scan_config_routes, credential_routes, scanners_routes, scheduler_routes
 app.include_router(target_routes.router, prefix="/api")
 app.include_router(scan_config_routes.router, prefix="/api")
 app.include_router(credential_routes.router, prefix="/api")
 app.include_router(scanners_routes.router, prefix="/api")
+app.include_router(scheduler_routes.router, prefix="/api")
+
+@app.on_event("startup")
+async def startup_event():
+    scheduler.scheduler.start()
+    scheduler.restore_pending_jobs()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.scheduler.shutdown()
+
 
 @app.get("/api/scanners")
 def list_scanners():
@@ -119,6 +142,37 @@ def list_scanners():
         return gvm_client.list_scanners()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+def get_nuclei_template_count() -> int:
+    import os
+    count = 0
+    base_dir = "/root/nuclei-templates"
+    if os.path.exists(base_dir):
+        for root, dirs, files in os.walk(base_dir):
+            for file in files:
+                if file.endswith(".yaml"):
+                    count += 1
+    return count
+
+@app.get("/api/feed-status")
+def get_feed_status():
+    try:
+        gvm_feeds = gvm_client.get_feed_status()
+    except Exception:
+        gvm_feeds = []
+        
+    try:
+        nuclei_count = get_nuclei_template_count()
+    except Exception:
+        nuclei_count = 0
+        
+    return {
+        "gvm_feeds": gvm_feeds,
+        "nuclei_templates": {
+            "count": nuclei_count,
+            "path": "/root/nuclei-templates"
+        }
+    }
 
 @app.get("/api/cves")
 def list_cves(search: str = Query("", max_length=100), page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=100)):
@@ -146,13 +200,38 @@ def list_tasks(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100))
 @app.post("/api/tasks")
 def create_task(task: TaskCreate, request: Request, admin: Any = Depends(admin_required)):
     try:
+        resolved_target_id = task.target_id
+        if resolved_target_id and resolved_target_id.startswith("group:"):
+            try:
+                group_id = int(resolved_target_id.split(":", 1)[1])
+                group = history_db.get_target_group_by_id(group_id)
+                if group and group.get("targets"):
+                    group_targets = group["targets"]
+                    hosts_list = group_targets if isinstance(group_targets, list) else [str(group_targets)]
+                    hosts_str = ", ".join([h.strip() for h in hosts_list if h.strip()])
+                    
+                    if hosts_str:
+                        group_tgt_name = f"[Group] {group['name']}"
+                        existing_targets = gvm_client.list_targets()
+                        found = next((t for t in existing_targets if t.get("name") == group_tgt_name), None)
+                        if found:
+                            resolved_target_id = found["id"]
+                        else:
+                            resolved_target_id = gvm_client.create_target(
+                                name=group_tgt_name,
+                                hosts=hosts_str,
+                                comment=f"Auto-generated GVM target for group {group['name']}"
+                            )
+            except Exception as ge:
+                logger.warning(f"Failed to auto-resolve target group {task.target_id}: {ge}")
+
         task_id = gvm_client.create_task(
             name=task.name,
-            target_id=task.target_id,
+            target_id=resolved_target_id,
             config_id=task.config_id,
             scanner_id=task.scanner_id or "08b69003-5fc2-4037-a479-93b440211c73",
         )
-        return {"id": task_id, "name": task.name, "target_id": task.target_id}
+        return {"id": task_id, "name": task.name, "target_id": resolved_target_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -195,16 +274,28 @@ def get_report(report_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/reports/{report_id}/download")
-def download_report(report_id: str, fmt: str = Query("html", description="Export format: xml, html, pdf")):
+def download_report(
+    report_id: str,
+    fmt: str = Query("html", description="Export format: xml, html, pdf"),
+    company: Optional[str] = Query(None),
+    auditor: Optional[str] = Query(None),
+    approved_by: Optional[str] = Query(None),
+    doc_title: Optional[str] = Query(None),
+):
     """
-    Download a full OpenVAS report.
-    - fmt=xml  → raw GVM XML (same as OpenVAS XML export)
-    - fmt=html → self-contained styled HTML report
-    - fmt=pdf  → PDF rendered from the styled HTML
+    Download a full OpenVAS / GVM Infrastructure Audit report.
+    - fmt=xml  → raw GVM XML
+    - fmt=html → executive styled HTML report
+    - fmt=pdf  → enterprise PDF report with cover page and methodology
     """
+    metadata = {
+        "organization": company or "Wyzmindz Solutions",
+        "prepared_by": auditor or "Santhosh M (Network Admin)",
+        "reviewed_by": approved_by or "Leo Antony Charles (IT Manager)",
+        "doc_title": doc_title or "Infrastructure Vulnerability Assessment & Penetration Testing Report"
+    }
     try:
         if fmt == "xml":
-            # Fetch raw XML directly from GVM
             raw_xml = gvm_client.get_report_raw_xml(report_id)
             filename = f"openvas-report-{report_id[:8]}.xml"
             return StreamingResponse(
@@ -213,36 +304,88 @@ def download_report(report_id: str, fmt: str = Query("html", description="Export
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'}
             )
         elif fmt == "pdf":
-            # Generate PDF from HTML
             report = gvm_client.get_report(report_id)
-            html_content = gvm_client.render_html_report(report)
+            html_content = gvm_client.render_html_report(report, metadata)
             pdf_bytes = pdfkit.from_string(html_content, False, options={
                 'page-size': 'A4',
-                'margin-top': '0.75in',
-                'margin-right': '0.75in',
-                'margin-bottom': '0.75in',
-                'margin-left': '0.75in',
+                'margin-top': '0.5in',
+                'margin-right': '0.5in',
+                'margin-bottom': '0.5in',
+                'margin-left': '0.5in',
                 'encoding': "UTF-8",
-                'no-outline': None
+                'no-outline': None,
+                'enable-local-file-access': None,
+                'quiet': ''
             })
-            filename = f"openvas-report-{report_id[:8]}.pdf"
-            return StreamingResponse(
-                iter([pdf_bytes]),
+            filename = f"openvas-vapt-audit-{report_id[:8]}.pdf"
+            return Response(
+                content=pdf_bytes,
                 media_type="application/pdf",
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
             )
         else:
             # Generate HTML report from parsed data
             report = gvm_client.get_report(report_id)
-            html_content = gvm_client.render_html_report(report)
-            filename = f"openvas-report-{report_id[:8]}.html"
-            return StreamingResponse(
-                iter([html_content.encode("utf-8")]),
+            html_content = gvm_client.render_html_report(report, metadata)
+            filename = f"openvas-vapt-audit-{report_id[:8]}.html"
+            return Response(
+                content=html_content.encode("utf-8"),
                 media_type="text/html",
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
             )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class WebReportPayload(BaseModel):
+    tool: str
+    target_url: str
+    results: Any
+    metadata: Optional[Dict[str, Any]] = None
+    format: Optional[str] = "html"
+
+@app.post("/api/reports/web-pentest/generate")
+def generate_web_pentest_report(payload: WebReportPayload):
+    from web_report_generator import WebReportGenerator
+    try:
+        norm = WebReportGenerator.normalize_findings(payload.tool, payload.results, payload.target_url)
+        fmt = (payload.format or "html").lower()
+        if fmt == "json":
+            return {
+                "status": "success",
+                "normalized": norm,
+                "html": WebReportGenerator.render_html_report(norm, payload.metadata)
+            }
+        elif fmt == "pdf":
+            pdf_bytes = WebReportGenerator.generate_pdf_report(norm, payload.metadata)
+            filename = f"vapt-{payload.tool.lower()}-report.pdf"
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
+            )
+        else:
+            html_str = WebReportGenerator.render_html_report(norm, payload.metadata)
+            filename = f"vapt-{payload.tool.lower()}-report.html"
+            return Response(
+                content=html_str.encode("utf-8"),
+                media_type="text/html",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Nmap API
 @app.get("/api/nmap/scan")
@@ -262,11 +405,40 @@ async def get_nmap_results(host: str = Query(..., description="Target Host IP or
                            scan_type: str = Query("quick", description="quick, service, os, full")):
     """
     Executes Nmap scan, parses and returns structured services list.
+    Checks for a very recent scan (within 60 seconds) in database first to avoid running it twice.
     """
     try:
+        # Check if there is a very recent scan result in the database
+        import sqlite3, json
+        from datetime import datetime, timedelta
+        
+        DB_PATH = "/root/vapt-dashboard/backend/data/vapt.db"
+        if os.path.exists(DB_PATH):
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT results, timestamp FROM scan_history 
+                    WHERE tool = 'nmap' AND target = ? AND scan_type = ? AND status = 'completed'
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (host, scan_type))
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row:
+                    timestamp_str = row["timestamp"]
+                    scan_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    if datetime.utcnow() - scan_time < timedelta(seconds=60):
+                        return json.loads(row["results"])
+            except Exception:
+                pass
+
         results = await nmap_client.scan_results_parsed(host, scan_type)
+        history_db.save_scan("nmap", host, scan_type, "completed", results)
         return results
     except Exception as e:
+        history_db.save_scan("nmap", host, scan_type, "failed", {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
 # Host compiled react static assets

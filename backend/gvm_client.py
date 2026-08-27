@@ -3,6 +3,7 @@ import uuid
 import logging
 import threading
 import xmltodict
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger("gvm_client")
@@ -61,6 +62,7 @@ class GVMClient:
         self.mock_mode = False
         # ── Persistent session ─────────────────────────────────────────────
         self._session_lock    = threading.Lock()
+        self._gmp_lock        = threading.Lock()
         self._session         = None   # active inner protocol instance kept open
         self._session_wrapper = None   # the Gmp instance to call __exit__ on
         self._session_born    = 0.0    # epoch when current session was opened
@@ -144,21 +146,27 @@ class GVMClient:
         entry = self._cache.get(key)
         if entry and (time.time() - entry["ts"] < _CACHE_TTL):
             return entry["data"]
-        gmp = self._get_session()
-        if gmp is None:
-            raise RuntimeError("Not connected to OpenVAS")
-        try:
-            result = fetch_fn(gmp)
-        except Exception:
-            # Session might have died – reopen once and retry
-            self._close_session()
-            self._open_session()
-            gmp = self._session
+            
+        with self._gmp_lock:
+            # Recheck cache inside lock
+            entry = self._cache.get(key)
+            if entry and (time.time() - entry["ts"] < _CACHE_TTL):
+                return entry["data"]
+            gmp = self._get_session()
             if gmp is None:
-                raise
-            result = fetch_fn(gmp)
-        self._cache[key] = {"ts": time.time(), "data": result}
-        return result
+                raise RuntimeError("Not connected to OpenVAS")
+            try:
+                result = fetch_fn(gmp)
+            except Exception:
+                # Session might have died – reopen once and retry
+                self._close_session()
+                self._open_session()
+                gmp = self._session
+                if gmp is None:
+                    raise
+                result = fetch_fn(gmp)
+            self._cache[key] = {"ts": time.time(), "data": result}
+            return result
 
     def _invalidate(self, *keys):
         for k in keys:
@@ -181,6 +189,7 @@ class GVMClient:
                     continue
                 ssh_cred = t.get("ssh_lsc_credential") or t.get("ssh_credential") or {}
                 smb_cred = t.get("smb_lsc_credential") or t.get("smb_credential") or {}
+                port_list = t.get("port_list") or {}
                 targets.append({
                     "id": t.get("@id"),
                     "name": t.get("name"),
@@ -190,15 +199,23 @@ class GVMClient:
                     "ssh_credential_name": ssh_cred.get("name") if isinstance(ssh_cred, dict) else None,
                     "smb_credential_id": smb_cred.get("@id") if isinstance(smb_cred, dict) else None,
                     "smb_credential_name": smb_cred.get("name") if isinstance(smb_cred, dict) else None,
+                    "port_list_id": port_list.get("@id") if isinstance(port_list, dict) else None,
+                    "port_list_name": port_list.get("name") if isinstance(port_list, dict) else None,
                 })
             return targets
         return self._cached_read("targets", fetch)
 
     def create_target(self, name: str, hosts: str, comment: str = "",
                       ssh_credential_id: Optional[str] = None,
-                      smb_credential_id: Optional[str] = None) -> str:
+                      smb_credential_id: Optional[str] = None,
+                      port_list_id: str = "33d0cd82-57c6-11e1-8ed1-406186ea4fc5") -> str:
         with self._get_gmp() as gmp:
-            kwargs: Dict[str, Any] = dict(name=name, hosts=[hosts], comment=comment)
+            kwargs: Dict[str, Any] = dict(
+                name=name,
+                hosts=[hosts],
+                comment=comment,
+                port_list_id=port_list_id
+            )
             if ssh_credential_id:
                 kwargs["ssh_credential_id"] = ssh_credential_id
             if smb_credential_id:
@@ -207,6 +224,30 @@ class GVMClient:
             data = xmltodict.parse(response)
             self._invalidate("targets")
             return data.get("create_target_response", {}).get("@id")
+
+    def modify_target(self, target_id: str, name: Optional[str] = None,
+                      hosts: Optional[str] = None, comment: Optional[str] = None,
+                      ssh_credential_id: Optional[str] = None,
+                      smb_credential_id: Optional[str] = None,
+                      port_list_id: Optional[str] = None) -> bool:
+        with self._get_gmp() as gmp:
+            kwargs: Dict[str, Any] = dict(target_id=target_id)
+            if name:
+                kwargs["name"] = name
+            if hosts:
+                kwargs["hosts"] = [hosts]
+            if comment is not None:
+                kwargs["comment"] = comment
+            if port_list_id:
+                kwargs["port_list_id"] = port_list_id
+            if ssh_credential_id:
+                kwargs["ssh_credential_id"] = ssh_credential_id
+            if smb_credential_id:
+                kwargs["smb_credential_id"] = smb_credential_id
+            
+            gmp.modify_target(**kwargs)
+            self._invalidate("targets")
+            return True
 
     def delete_target(self, target_id: str) -> bool:
         try:
@@ -217,6 +258,45 @@ class GVMClient:
         except Exception as e:
             logger.error(f"Error deleting target {target_id}: {e}")
             return False
+
+    def list_port_lists(self) -> List[Dict[str, Any]]:
+        def fetch(gmp):
+            response = gmp.get_port_lists()
+            data = xmltodict.parse(response)
+            pl_xml = data.get("get_port_lists_response", {}).get("port_list", [])
+            if not isinstance(pl_xml, list):
+                pl_xml = [pl_xml]
+            res = []
+            for p in pl_xml:
+                if not p:
+                    continue
+                res.append({
+                    "id": p.get("@id"),
+                    "name": p.get("name"),
+                    "comment": p.get("comment", "")
+                })
+            return res
+        return self._cached_read("port_lists", fetch)
+
+    def get_feed_status(self) -> List[Dict[str, Any]]:
+        def fetch(gmp):
+            response = gmp.get_feeds()
+            data = xmltodict.parse(response)
+            feeds = data.get("get_feeds_response", {}).get("feed", [])
+            if not isinstance(feeds, list):
+                feeds = [feeds]
+            res = []
+            for f in feeds:
+                if not f:
+                    continue
+                res.append({
+                    "type": f.get("type"),
+                    "name": f.get("name"),
+                    "version": f.get("version"),
+                    "description": f.get("description", "")
+                })
+            return res
+        return self._cached_read("feed_status", fetch)
 
     # ──────────────────────────────────────────────────────────────────────────
     # CREDENTIAL MANAGEMENT
@@ -250,7 +330,19 @@ class GVMClient:
                            username: str, password: Optional[str] = None,
                            private_key: Optional[str] = None,
                            comment: str = "") -> str:
-        from gvm.protocols.gmp.requests import CredentialType
+        try:
+            from gvm.protocols.gmp.requests.v227 import CredentialType
+        except ImportError:
+            try:
+                from gvm.protocols.gmp.requests.v226 import CredentialType
+            except ImportError:
+                try:
+                    from gvm.protocols.gmp.requests.v225 import CredentialType
+                except ImportError:
+                    try:
+                        from gvm.protocols.gmp.requests.v224 import CredentialType
+                    except ImportError:
+                        from gvm.protocols.gmp.requests.next import CredentialType
         type_map = {
             "ssh_password": CredentialType.USERNAME_PASSWORD,
             "ssh_key":      CredentialType.USERNAME_SSH_KEY,
@@ -263,13 +355,93 @@ class GVMClient:
                 name=name, credential_type=gvm_type, login=username, comment=comment,
             )
             if private_key:
-                kwargs["key"] = {"private": private_key}
+                kwargs["private_key"] = private_key
             elif password:
                 kwargs["password"] = password
             response = gmp.create_credential(**kwargs)
             data = xmltodict.parse(response)
+            resp_node = data.get("create_credential_response", {})
+            status = resp_node.get("@status")
+            if status not in ("200", "201"):
+                status_text = resp_node.get("@status_text", "Unknown GVM error")
+                raise Exception(status_text)
             self._invalidate("credentials")
-            return data.get("create_credential_response", {}).get("@id")
+            return resp_node.get("@id")
+
+    def modify_credential(self, cred_id: str, name: Optional[str] = None,
+                          credential_type: Optional[str] = None,
+                          username: Optional[str] = None, password: Optional[str] = None,
+                          private_key: Optional[str] = None, comment: Optional[str] = None) -> bool:
+        # Check if type changed
+        current_creds = self.list_credential_sets()
+        curr = next((c for c in current_creds if c["id"] == cred_id), None)
+        
+        type_map_normalized = {
+            "ssh_password": "username+password",
+            "ssh_key": "ssh_key",
+            "smb": "smb",
+            "rdp": "rdp"
+        }
+        
+        type_changed = False
+        if curr and credential_type:
+            target_mapped = type_map_normalized.get(credential_type, credential_type)
+            curr_type = curr.get("type", "")
+            curr_type_norm = type_map_normalized.get(curr_type, curr_type)
+            if curr_type_norm != target_mapped:
+                type_changed = True
+
+        if type_changed and curr:
+            new_name = name or curr.get("name", "Credential")
+            new_user = username or curr.get("username", "root")
+            new_id = self.create_credential(
+                name=new_name,
+                credential_type=credential_type,
+                username=new_user,
+                password=password,
+                private_key=private_key,
+                comment=comment or curr.get("comment", "")
+            )
+            # Re-link any targets that used the old cred_id
+            try:
+                targets = self.get_targets()
+                for t in targets:
+                    tid = t.get("id")
+                    updated = False
+                    ssh_id = t.get("ssh_credential_id")
+                    smb_id = t.get("smb_credential_id")
+                    if ssh_id == cred_id:
+                        ssh_id = new_id
+                        updated = True
+                    if smb_id == cred_id:
+                        smb_id = new_id
+                        updated = True
+                    if updated:
+                        self.modify_target(tid, ssh_credential_id=ssh_id, smb_credential_id=smb_id)
+            except Exception as e:
+                logger.error(f"Error re-linking targets to updated credential: {e}")
+                
+            self.delete_credential(cred_id)
+            self._invalidate("credentials")
+            self._invalidate("targets")
+            return True
+        else:
+            with self._get_gmp() as gmp:
+                kwargs: Dict[str, Any] = dict(credential_id=cred_id)
+                if name:
+                    kwargs["name"] = name
+                if username:
+                    kwargs["login"] = username
+                if password:
+                    kwargs["password"] = password
+                if private_key:
+                    kwargs["private_key"] = private_key
+                if comment is not None:
+                    kwargs["comment"] = comment
+                
+                gmp.modify_credential(**kwargs)
+                self._invalidate("credentials")
+                return True
 
     def delete_credential(self, cred_id: str) -> bool:
         try:
@@ -311,15 +483,97 @@ class GVMClient:
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_cves(self, search_term: str = "", page: int = 1, limit: int = 50) -> Dict[str, Any]:
+        if self.mock_mode:
+            mock_data = [
+                {
+                    "id": "CVE-2021-44228",
+                    "name": "CVE-2021-44228",
+                    "creation_time": "2021-12-10T00:00:00Z",
+                    "modification_time": "2021-12-15T00:00:00Z",
+                    "description": "Apache Log4j2 2.0-beta9 through 2.15.0 JNDI features used in configuration, log messages, and parameters do not protect against attacker controlled LDAP and other JNDI related endpoints (Log4Shell).",
+                    "severity": "10.0",
+                    "cvss": "10.0"
+                },
+                {
+                    "id": "CVE-2017-0144",
+                    "name": "CVE-2017-0144",
+                    "creation_time": "2017-03-14T00:00:00Z",
+                    "modification_time": "2017-03-20T00:00:00Z",
+                    "description": "The SMBv1 server in Microsoft Windows Vista SP2, Windows 7 SP1, Windows 8.1, Windows RT 8.1, Windows Server 2008 SP2, Windows Server 2012, and Windows Server 2016 allows remote attackers to execute arbitrary code via crafted packets (EternalBlue).",
+                    "severity": "8.1",
+                    "cvss": "8.1"
+                },
+                {
+                    "id": "CVE-2014-0160",
+                    "name": "CVE-2014-0160",
+                    "creation_time": "2014-04-07T00:00:00Z",
+                    "modification_time": "2014-04-10T00:00:00Z",
+                    "description": "The (1) TLS and (2) DTLS implementations in OpenSSL 1.0.1 before 1.0.1g do not properly handle Heartbeat Extension packets, which allows remote attackers to obtain sensitive information from process memory (Heartbleed).",
+                    "severity": "5.0",
+                    "cvss": "5.0"
+                },
+                {
+                    "id": "CVE-2020-0601",
+                    "name": "CVE-2020-0601",
+                    "creation_time": "2020-01-14T00:00:00Z",
+                    "modification_time": "2020-01-18T00:00:00Z",
+                    "description": "A spoofing vulnerability exists in the way Windows CryptoAPI (Crypt32.dll) validates Elliptic Curve Cryptography (ECC) certificates.",
+                    "severity": "8.1",
+                    "cvss": "8.1"
+                },
+                {
+                    "id": "CVE-2019-0708",
+                    "name": "CVE-2019-0708",
+                    "creation_time": "2019-05-14T00:00:00Z",
+                    "modification_time": "2019-05-20T00:00:00Z",
+                    "description": "A remote code execution vulnerability exists in Remote Desktop Services formerly known as Terminal Services when an unauthenticated attacker connects to the target system using RDP and sends specially crafted requests (BlueKeep).",
+                    "severity": "9.8",
+                    "cvss": "9.8"
+                }
+            ]
+            term = (search_term or "").strip().lower()
+            filtered_mock = mock_data
+            if term:
+                filtered_mock = [
+                    c for c in mock_data
+                    if term in c["name"].lower() or term in c["description"].lower()
+                ]
+            start = (page - 1) * limit
+            end = start + limit
+            return {
+                "cves": filtered_mock[start:end],
+                "total": len(filtered_mock),
+                "page": page,
+                "limit": limit
+            }
+
+        key = f"cves:{search_term.strip().lower()}:{page}:{limit}"
+        entry = self._cache.get(key)
+        if entry and (time.time() - entry["ts"] < 3600):
+            return entry["data"]
+
         def fetch(gmp):
             filter_str = f"rows={limit} first={(page - 1) * limit + 1} sort-reverse=creation_time"
-            if search_term and search_term.strip().upper() != "CVE":
-                filter_str += f" {search_term}"
+            term = (search_term or "").strip()
+            if term and term.upper() != "CVE":
+                import re
+                cve_match_exact = re.match(r'^cve-\d{4}-\d+$', term, re.IGNORECASE)
+                cve_match_partial = re.match(r'^cve-\d{4}-?$', term, re.IGNORECASE)
+                cve_start = re.match(r'^cve-?$', term, re.IGNORECASE)
+                has_operator = any(op in term for op in ('=', '~', '>', '<', ':'))
+                
+                if has_operator:
+                    filter_str += f" {term}"
+                elif cve_match_exact:
+                    filter_str += f' name="{term.upper()}"'
+                elif cve_match_partial or cve_start:
+                    filter_str += f' name~"{term.upper()}"'
+                else:
+                    filter_str += f' description~"{term}"'
             
             response = gmp.get_cves(filter_string=filter_str)
             data = xmltodict.parse(response)
             info_resp = data.get("get_info_response", {})
-            
             info_list = info_resp.get("info", [])
             if not isinstance(info_list, list):
                 info_list = [info_list] if info_list else []
@@ -347,11 +601,25 @@ class GVMClient:
                 "limit": limit
             }
         
-        # Don't cache search results
-        gmp = self._get_session()
-        if gmp is None:
-            raise RuntimeError("Not connected to OpenVAS")
-        return fetch(gmp)
+        with self._gmp_lock:
+            # Recheck cache inside lock
+            entry = self._cache.get(key)
+            if entry and (time.time() - entry["ts"] < 3600):
+                return entry["data"]
+            gmp = self._get_session()
+            if gmp is None:
+                raise RuntimeError("Not connected to OpenVAS")
+            try:
+                result = fetch(gmp)
+            except Exception:
+                self._close_session()
+                self._open_session()
+                gmp = self._session
+                if gmp is None:
+                    raise
+                result = fetch(gmp)
+            self._cache[key] = {"ts": time.time(), "data": result}
+            return result
 
     # ──────────────────────────────────────────────────────────────────────────
     # TASK MANAGEMENT
@@ -596,22 +864,63 @@ class GVMClient:
                 return response.encode("utf-8")
             return response
 
-    def render_html_report(self, report: Dict[str, Any]) -> str:
-        """Generate a classic OpenVAS LaTeX-style HTML report for PDF export."""
+    def render_html_report(self, report: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Generate an enterprise-grade Infrastructure VAPT Audit Report for OpenVAS/GVM scans.
+        Includes cover page, auditor details, approver details, full Scanned Contents Table of Contents,
+        methodology, executive posture, and detailed findings.
+        """
+        import html
+        metadata = metadata or {}
         summary = report.get("summary", {})
         vulns   = report.get("vulnerabilities", [])
-        task    = report.get("task_name", "Unknown Task")
+        task    = report.get("task_name", "Infrastructure Security Assessment")
         start   = report.get("scan_start", "—")
         end     = report.get("scan_end", "—")
+
+        # Metadata defaults & overrides
+        report_date = metadata.get("report_date") or datetime.now().strftime("%d %b, %Y")
+        doc_title   = metadata.get("doc_title") or f"Infrastructure Vulnerability Assessment & Penetration Testing Report"
+        org_name    = metadata.get("organization") or metadata.get("company_name") or "Wyzmindz Solutions"
+        prepared_by = metadata.get("prepared_by") or metadata.get("auditor") or "Santhosh M (Network Admin)"
+        reviewed_by = metadata.get("reviewed_by") or metadata.get("approved_by") or "Leo Antony Charles (IT Manager)"
+        doc_id      = metadata.get("doc_id") or "VAPT-GVM-" + datetime.now().strftime("%Y%m%d-%H%M")
         
-        # OpenVAS LaTeX Severity Colors
+        # Severity Colors
         sev_color = {
-            "High": "#b91c1c",    # Red
-            "Medium": "#ea580c",  # Orange
-            "Low": "#0284c7",     # Blue
-            "Log": "#475569"      # Gray
+            "Critical": "#dc2626",
+            "High": "#ea580c",
+            "Medium": "#d97706",
+            "Low": "#2563eb",
+            "Log": "#64748b",
+            "Info": "#64748b",
+            "Informational": "#64748b"
         }
-        
+
+        # Calculate counts
+        high_cnt = summary.get("high", 0)
+        med_cnt  = summary.get("medium", 0)
+        low_cnt  = summary.get("low", 0)
+        log_cnt  = summary.get("log", 0)
+        total_vulns = len(vulns)
+
+        if high_cnt > 0:
+            posture_level = "WEAK"
+            posture_color = "#dc2626"
+            posture_desc = "The infrastructure security posture is currently weak due to active high-severity vulnerabilities that present immediate operational and data compromise risks. Urgent patching is required."
+        elif med_cnt > 0:
+            posture_level = "MODERATE"
+            posture_color = "#d97706"
+            posture_desc = "The infrastructure displays a moderate security posture. While no immediate critical exploits were verified, medium-severity flaws require prioritized remediation to prevent exploitation chains."
+        elif low_cnt > 0:
+            posture_level = "GOOD"
+            posture_color = "#2563eb"
+            posture_desc = "A solid defensive baseline is maintained with only low-severity configuration hygiene items identified across the audited assets."
+        else:
+            posture_level = "EXCELLENT"
+            posture_color = "#16a34a"
+            posture_desc = "All assessed infrastructure assets passed without exploitable vulnerabilities, reflecting adherence to hardened security baselines."
+
         # Group vulnerabilities by host
         hosts = {}
         for v in vulns:
@@ -619,166 +928,554 @@ class GVMClient:
             if h not in hosts:
                 hosts[h] = []
             hosts[h].append(v)
-            
-        # Build Table of Contents and Body
-        toc_html = "<h2>Contents</h2><ul class='toc'>"
-        toc_html += "<li><a href='#sec-1'>1 Result Overview</a></li>"
-        toc_html += "<li><a href='#sec-2'>2 Results per Host</a></li>"
-        
-        body_html = f"<h2 id='sec-1'>1 Result Overview</h2>"
-        body_html += f"""
-        <table class='overview-table'>
-            <thead>
-                <tr>
-                    <th>Host</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Log</th><th>False P.</th>
-                </tr>
-            </thead>
-            <tbody>
-        """
+
+        host_list_str = ", ".join(list(hosts.keys())) if hosts else "Assigned Network Scope"
+
+        # ── Table of Contents & Scanned Items List ──
+        toc_hosts_html = ""
+        host_num = 1
         for h, host_vulns in hosts.items():
-            h_high = sum(1 for v in host_vulns if v.get("severity") == "High")
-            h_med  = sum(1 for v in host_vulns if v.get("severity") == "Medium")
-            h_low  = sum(1 for v in host_vulns if v.get("severity") == "Low")
-            h_log  = sum(1 for v in host_vulns if v.get("severity") == "Log")
-            body_html += f"<tr><td><a href='#host-{h}'>{h}</a></td><td>0</td><td>{h_high}</td><td>{h_med}</td><td>{h_low}</td><td>{h_log}</td><td>0</td></tr>"
-            
-        body_html += f"""
-            <tr class='total-row'>
-                <td>Total: {len(hosts)}</td><td>0</td><td>{summary.get('high', 0)}</td><td>{summary.get('medium', 0)}</td><td>{summary.get('low', 0)}</td><td>{summary.get('log', 0)}</td><td>0</td>
-            </tr>
-            </tbody>
-        </table>
-        <p style="font-size: 13px; margin-top: 15px;">This report contains all {len(vulns)} results. Overrides are off. Notes are included.</p>
-        """
-        
-        body_html += "<h2 id='sec-2' style='page-break-before: always;'>2 Results per Host</h2>"
-        
-        host_idx = 1
-        for h, host_vulns in hosts.items():
-            toc_html += f"<li><a href='#host-{h}'>2.{host_idx} {h}</a></li>"
-            body_html += f"<h3 id='host-{h}'>2.{host_idx} {h}</h3>"
-            body_html += f"<p style='font-size: 13px; margin-bottom: 20px;'>Host scan start: {start}<br>Host scan end: {end}</p>"
-            
-            vuln_idx = 1
-            for v in host_vulns:
-                sev = v.get("severity", "Log")
-                color = sev_color.get(sev, "#475569")
-                port = v.get("port", "general/tcp")
-                title = f"2.{host_idx}.{vuln_idx} {sev} {port}"
-                cve = v.get("cve", "")
-                
-                # TOC Entry for Vulnerability
-                toc_html += f"<li class='toc-sub'><a href='#vuln-{host_idx}-{vuln_idx}'>{title}</a></li>"
-                
-                body_html += f"<h4 id='vuln-{host_idx}-{vuln_idx}'>{title}</h4>"
-                
-                # Build rows dynamically based on presence
-                rows = ""
-                
-                if v.get("description"):
-                    rows += f"<tr><td><strong>Summary</strong><br/>{v.get('description', '')}</td></tr>"
-                
-                if v.get("qod"):
-                    rows += f"<tr><td><strong>Quality of Detection (QoD):</strong> {v.get('qod', '')}%</td></tr>"
-                    
-                if v.get("vuldetect"):
-                    rows += f"<tr><td><strong>Vulnerability Detection Method</strong><br/>{v.get('vuldetect', '')}</td></tr>"
-                    
-                if v.get("impact"):
-                    rows += f"<tr><td><strong>Impact</strong><br/>{v.get('impact', '')}</td></tr>"
-                
-                if v.get("solution"):
-                    sol_type = f"<strong>Solution type:</strong> {v.get('solution_type', 'Mitigation')}<br/>" if v.get('solution_type') else ""
-                    rows += f"<tr><td><strong>Solution:</strong><br/>{sol_type}{v.get('solution', '')}</td></tr>"
-                
-                if v.get("affected"):
-                    rows += f"<tr><td><strong>Affected Software/OS</strong><br/>{v.get('affected', '')}</td></tr>"
-                    
-                if v.get("insight"):
-                    rows += f"<tr><td><strong>Vulnerability Insight</strong><br/>{v.get('insight', '')}</td></tr>"
-                    
-                if cve:
-                    rows += f"<tr><td><strong>References</strong><br/>cve: {cve}</td></tr>"
-                
-                body_html += f"""
-                <table class='vuln-table'>
+            toc_hosts_html += f"""
+            <div style="margin-top: 14px; margin-bottom: 8px;">
+                <div style="font-weight: 700; color: #0284c7; font-size: 13px; margin-bottom: 6px;">
+                    <a href="#host-{h}" style="color: #0284c7; text-decoration: none;">4.{host_num} Host: {html.escape(h)} <span style="font-size: 11px; color: #64748b; font-weight: normal;">({len(host_vulns)} Scanned Results)</span></a>
+                </div>
+                <table class="styled-table" style="font-size: 11px; margin-top: 4px; margin-bottom: 12px;">
                     <thead>
-                        <tr>
-                            <th style='background-color: {color}; color: white;'>{sev} (CVSS: {v.get('cvss', 0.0):.1f})<br/>NVT: {v.get('name', '')}</th>
+                        <tr style="background: #1e293b;">
+                            <th style="width: 9%; text-align: center;">Item</th>
+                            <th style="width: 14%; text-align: center;">Severity</th>
+                            <th style="width: 16%;">Port / Proto</th>
+                            <th>Scanned Vulnerability / NVT Test Name</th>
+                            <th style="width: 10%; text-align: center;">CVSS</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {rows}
+            """
+            item_num = 1
+            for v in host_vulns:
+                raw_sev = (v.get("severity") or "Log").capitalize()
+                sev = "Informational" if raw_sev in ["Log", "Info"] else raw_sev
+                badge_bg = sev_color.get(sev, "#64748b")
+                port = v.get("port", "general/tcp")
+                name = v.get("name", "Vulnerability Finding")
+                cvss_score = float(v.get("cvss", 0.0))
+                
+                toc_hosts_html += f"""
+                        <tr>
+                            <td style="text-align: center; font-weight: 600; color: #475569;">4.{host_num}.{item_num}</td>
+                            <td style="text-align: center;"><span style="background: {badge_bg}; color: white; padding: 2px 7px; border-radius: 4px; font-weight: 700; font-size: 10px; text-transform: uppercase;">{sev}</span></td>
+                            <td style="font-family: monospace; color: #0284c7; font-weight: 600;">{html.escape(port)}</td>
+                            <td><a href="#vuln-{host_num}-{item_num}" style="color: #0f172a; text-decoration: none; font-weight: 600;">{html.escape(name)}</a></td>
+                            <td style="text-align: center; font-weight: 700; color: {'#dc2626' if cvss_score>=7.0 else '#ea580c' if cvss_score>=4.0 else '#0f172a'};">{cvss_score:.1f}</td>
+                        </tr>
+                """
+                item_num += 1
+
+            toc_hosts_html += """
                     </tbody>
                 </table>
-                """
-                vuln_idx += 1
-            host_idx += 1
-            
-        toc_html += "</ul>"
+            </div>
+            """
+            host_num += 1
 
+        # ── Overview Table Rows ──
+        overview_rows_html = ""
+        for h, host_vulns in hosts.items():
+            h_high = sum(1 for v in host_vulns if (v.get("severity") or "").capitalize() == "High")
+            h_med  = sum(1 for v in host_vulns if (v.get("severity") or "").capitalize() == "Medium")
+            h_low  = sum(1 for v in host_vulns if (v.get("severity") or "").capitalize() == "Low")
+            h_log  = sum(1 for v in host_vulns if (v.get("severity") or "").capitalize() in ["Log", "Info"])
+            overview_rows_html += f"""
+            <tr>
+                <td style="font-weight: 600; font-family: monospace; color: #0284c7;"><a href="#host-{h}" style="color: #0284c7; text-decoration: none;">{html.escape(h)}</a></td>
+                <td style="text-align: center; font-weight: {'bold' if h_high>0 else 'normal'}; color: {'#dc2626' if h_high>0 else '#64748b'};">{h_high}</td>
+                <td style="text-align: center; font-weight: {'bold' if h_med>0 else 'normal'}; color: {'#ea580c' if h_med>0 else '#64748b'};">{h_med}</td>
+                <td style="text-align: center; color: {'#2563eb' if h_low>0 else '#64748b'};">{h_low}</td>
+                <td style="text-align: center; color: #64748b;">{h_log}</td>
+                <td style="text-align: center; font-weight: 700;">{len(host_vulns)}</td>
+            </tr>
+            """
+
+        # ── Detailed Findings Cards ──
+        findings_html = ""
+        finding_id = 1
+        h_idx = 1
+        for h, host_vulns in hosts.items():
+            findings_html += f"""
+            <div id="host-{h}" style="margin-top: 30px; margin-bottom: 15px; padding-bottom: 6px; border-bottom: 2px solid #0f172a; display: flex; justify-content: space-between; align-items: flex-end;">
+                <h3 style="margin: 0; color: #0f172a; font-size: 16px;">Target Host: <code style="color: #0284c7;">{html.escape(h)}</code></h3>
+                <span style="font-size: 11px; color: #64748b;">{len(host_vulns)} Scanned Results</span>
+            </div>
+            """
+            v_idx = 1
+            for v in host_vulns:
+                raw_sev = (v.get("severity") or "Log").capitalize()
+                sev = "Informational" if raw_sev in ["Log", "Info"] else raw_sev
+                color = sev_color.get(sev, "#64748b")
+                port = v.get("port", "general/tcp")
+                name = v.get("name", "Vulnerability Finding")
+                cvss_score = float(v.get("cvss", 0.0))
+                cve = v.get("cve", "")
+                qod = v.get("qod", "")
+
+                details_blocks = ""
+                if v.get("description"):
+                    details_blocks += f"""
+                    <div style="margin-top: 10px;">
+                        <h5 style="margin: 0 0 4px 0; font-size: 12px; text-transform: uppercase; color: #0f172a; letter-spacing: 0.5px;">Summary &amp; Description</h5>
+                        <p style="margin: 0 0 10px 0; color: #334155; font-size: 12px; line-height: 1.6; text-align: justify;">{html.escape(v.get('description',''))}</p>
+                    </div>
+                    """
+
+                if v.get("vuldetect"):
+                    details_blocks += f"""
+                    <div style="margin-top: 8px;">
+                        <h5 style="margin: 0 0 4px 0; font-size: 11px; text-transform: uppercase; color: #475569;">Vulnerability Detection Method</h5>
+                        <pre style="background: #0f172a; color: #38bdf8; padding: 10px 12px; border-radius: 6px; font-family: monospace; font-size: 11px; line-height: 1.4; white-space: pre-wrap; margin: 0 0 10px 0;">{html.escape(v.get('vuldetect',''))}</pre>
+                    </div>
+                    """
+
+                if v.get("impact"):
+                    details_blocks += f"""
+                    <div style="margin-top: 8px;">
+                        <h5 style="margin: 0 0 4px 0; font-size: 11px; text-transform: uppercase; color: #dc2626;">Technical Impact</h5>
+                        <p style="margin: 0 0 10px 0; color: #334155; font-size: 12px; line-height: 1.5;">{html.escape(v.get('impact',''))}</p>
+                    </div>
+                    """
+
+                if v.get("solution"):
+                    sol_type_badge = f"<span style='background: #e2e8f0; color: #334155; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-left: 6px;'>{html.escape(v.get('solution_type','Mitigation'))}</span>" if v.get("solution_type") else ""
+                    details_blocks += f"""
+                    <div style="margin-top: 10px; background: #f0fdf4; border-left: 4px solid #16a34a; padding: 12px 16px; border-radius: 0 6px 6px 0;">
+                        <h5 style="margin: 0 0 4px 0; font-size: 12px; text-transform: uppercase; color: #15803d; font-weight: 700;">Remediation &amp; Mitigation {sol_type_badge}</h5>
+                        <p style="margin: 0; color: #166534; font-size: 12px; line-height: 1.5;">{html.escape(v.get('solution',''))}</p>
+                    </div>
+                    """
+
+                if cve and cve != "N/A":
+                    details_blocks += f"""
+                    <div style="margin-top: 8px; font-size: 11px; color: #64748b;">
+                        <strong>CVE References:</strong> <code style="color: #ea580c;">{html.escape(cve)}</code>
+                    </div>
+                    """
+
+                findings_html += f"""
+                <div id="vuln-{h_idx}-{v_idx}" class="finding-card" style="page-break-inside: avoid; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 20px; background: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); overflow: hidden;">
+                    <div style="background: #f8fafc; border-bottom: 2px solid {color}; padding: 10px 16px; display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <span style="background: {color}; color: white; padding: 3px 8px; border-radius: 4px; font-weight: 800; font-size: 11px; margin-right: 8px;">#{finding_id} (4.{h_idx}.{v_idx})</span>
+                            <strong style="font-size: 14px; color: #0f172a;">{html.escape(name)}</strong>
+                        </div>
+                        <span style="background: {color}; color: white; padding: 4px 10px; border-radius: 4px; font-weight: 700; font-size: 11px; text-transform: uppercase;">{sev}</span>
+                    </div>
+                    <div style="padding: 14px 18px;">
+                        <table style="width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 12px;">
+                            <tr style="border-bottom: 1px solid #f1f5f9;">
+                                <td style="width: 25%; padding: 5px 0; color: #64748b; font-weight: 600;">TARGET PORT</td>
+                                <td style="padding: 5px 0; font-family: monospace; color: #0284c7; font-weight: 600;">{html.escape(port)}</td>
+                            </tr>
+                            <tr style="border-bottom: 1px solid #f1f5f9;">
+                                <td style="padding: 5px 0; color: #64748b; font-weight: 600;">CVSS v3.1 BASE SCORE</td>
+                                <td style="padding: 5px 0; color: #0f172a;"><strong>{cvss_score:.1f}</strong> / 10.0</td>
+                            </tr>
+                            {f'<tr style="border-bottom: 1px solid #f1f5f9;"><td style="padding: 5px 0; color: #64748b; font-weight: 600;">DETECTION QUALITY (QoD)</td><td style="padding: 5px 0; color: #334155;">{qod}%</td></tr>' if qod else ''}
+                        </table>
+                        {details_blocks}
+                    </div>
+                </div>
+                """
+                finding_id += 1
+                v_idx += 1
+            h_idx += 1
+
+        # ── Full HTML Document ──
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <title>Scan Report</title>
-  <style>
-    body {{
-        font-family: "Times New Roman", Times, serif;
-        font-size: 14px;
-        line-height: 1.4;
-        color: #000;
-        max-width: 800px;
-        margin: 0 auto;
-        padding: 40px 20px;
-    }}
-    h1 {{ text-align: center; font-size: 28px; font-weight: normal; margin-top: 100px; margin-bottom: 40px; }}
-    .title-date {{ text-align: center; font-size: 18px; margin-bottom: 60px; }}
-    .title-summary {{ text-align: center; font-weight: bold; margin-bottom: 10px; }}
-    .title-desc {{ text-align: justify; margin-bottom: 100px; font-size: 14px; line-height: 1.6; padding: 0 40px; }}
-    
-    h2 {{ font-size: 22px; border-bottom: 1px solid #ccc; padding-bottom: 5px; margin-top: 40px; }}
-    h3 {{ font-size: 18px; margin-top: 30px; }}
-    h4 {{ font-size: 16px; margin-top: 25px; margin-bottom: 10px; }}
-    
-    a {{ color: #0284c7; text-decoration: none; }}
-    
-    .toc {{ list-style-type: none; padding-left: 0; }}
-    .toc li {{ margin-bottom: 5px; font-size: 14px; font-weight: bold; color: #0284c7; }}
-    .toc .toc-sub {{ padding-left: 20px; font-weight: normal; font-size: 13px; }}
-    
-    table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }}
-    th, td {{ border: 1px solid #000; padding: 8px 12px; text-align: left; vertical-align: top; }}
-    
-    .overview-table th {{ background-color: #8ba3c7; color: #000; font-weight: bold; text-align: center; }}
-    .overview-table td {{ text-align: center; }}
-    .overview-table td:first-child {{ text-align: left; }}
-    .total-row {{ font-weight: bold; border-top: 2px solid #000; }}
-    
-    .vuln-table th {{ text-align: left; font-weight: normal; font-size: 14px; padding: 10px; }}
-    .vuln-table td {{ font-size: 13px; line-height: 1.5; }}
-    .vuln-table strong {{ display: block; margin-bottom: 4px; font-size: 14px; }}
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Infrastructure VAPT Report - {html.escape(task)}</title>
+    <style>
+        @page {{
+            size: A4;
+            margin: 18mm 15mm 18mm 15mm;
+            @bottom-right {{
+                content: counter(page);
+            }}
+        }}
+        body {{
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+            color: #1e293b;
+            background: #ffffff;
+            line-height: 1.5;
+            margin: 0;
+            padding: 0;
+            font-size: 12px;
+        }}
+        .page-break {{ page-break-before: always; }}
+        .no-break {{ page-break-inside: avoid; }}
+        .report-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #e2e8f0;
+            padding-bottom: 8px;
+            margin-bottom: 24px;
+            font-size: 11px;
+            color: #64748b;
+        }}
+        .brand-logo {{
+            font-size: 18px;
+            font-weight: 800;
+            color: #0f172a;
+            letter-spacing: -0.5px;
+        }}
+        .brand-logo span {{ color: #0284c7; }}
+        .cover-container {{
+            min-height: 85vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 40px 10px;
+        }}
+        .cover-title {{
+            font-size: 30px;
+            font-weight: 800;
+            color: #0f172a;
+            line-height: 1.2;
+            margin: 0 0 10px 0;
+        }}
+        .cover-subtitle {{
+            font-size: 16px;
+            color: #0284c7;
+            font-weight: 600;
+            margin: 0 0 40px 0;
+        }}
+        .meta-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 25px;
+            font-size: 13px;
+        }}
+        .meta-table td {{
+            padding: 9px 14px;
+            border-bottom: 1px solid #e2e8f0;
+        }}
+        .meta-table td:first-child {{
+            font-weight: 700;
+            color: #475569;
+            width: 35%;
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            background: #f8fafc;
+        }}
+        table.styled-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+            font-size: 12px;
+        }}
+        table.styled-table th {{
+            background: #0f172a;
+            color: #ffffff;
+            font-weight: 600;
+            text-align: left;
+            padding: 9px 12px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        table.styled-table td {{
+            padding: 9px 12px;
+            border-bottom: 1px solid #e2e8f0;
+            color: #334155;
+        }}
+        table.styled-table tr:nth-child(even) {{ background: #f8fafc; }}
+        h1, h2, h3, h4, h5 {{ color: #0f172a; font-weight: 700; }}
+        h2.section-heading {{
+            font-size: 18px;
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 6px;
+            margin-top: 35px;
+            margin-bottom: 16px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .kpi-card {{
+            border-radius: 8px;
+            padding: 14px;
+            text-align: center;
+            flex: 1;
+            color: white;
+        }}
+        .kpi-number {{ font-size: 26px; font-weight: 800; line-height: 1; margin-bottom: 4px; }}
+        .kpi-label {{ font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
+    </style>
 </head>
 <body>
-  <h1>Scan Report</h1>
-  <div class="title-date">August 2026</div>
-  <div class="title-summary">Summary</div>
-  <div class="title-desc">
-    This document reports on the results of an automatic security scan. All dates are displayed using the timezone "Coordinated Universal Time", which is abbreviated "UTC". The task was "{task}". The scan started at {start} and ended at {end}. The report first summarises the results found. Then, for each host, the report describes every issue found. Please consider the advice given in each description, in order to rectify the issue.
-  </div>
-  
-  <div style="page-break-after: always;"></div>
-  
-  {toc_html}
-  
-  <div style="page-break-after: always;"></div>
-  
-  {body_html}
+
+    <!-- ════════════════════════ COVER PAGE ════════════════════════ -->
+    <div class="cover-container">
+        <div class="report-header">
+            <div class="brand-logo">VAPT<span>SHIELD</span> // INFRASTRUCTURE AUDIT</div>
+            <div>{html.escape(report_date)}</div>
+        </div>
+
+        <div style="margin-top: 50px;">
+            <div style="display: inline-block; background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 12px; text-transform: uppercase; margin-bottom: 16px; letter-spacing: 1px;">
+                INTERNAL SECURITY ASSESSMENT REPORT
+            </div>
+            <h1 class="cover-title">{html.escape(doc_title)}</h1>
+            <div class="cover-subtitle">Task: {html.escape(task)}</div>
+        </div>
+
+        <div>
+            <table class="meta-table">
+                <tr>
+                    <td>Report Release Date</td>
+                    <td><strong>{html.escape(report_date)}</strong></td>
+                </tr>
+                <tr>
+                    <td>Client / Organization</td>
+                    <td><strong>{html.escape(org_name)}</strong></td>
+                </tr>
+                <tr>
+                    <td>Assessment Conducted By</td>
+                    <td><strong>{html.escape(prepared_by)}</strong></td>
+                </tr>
+                <tr>
+                    <td>Reviewed &amp; Approved By</td>
+                    <td><strong>{html.escape(reviewed_by)}</strong></td>
+                </tr>
+                <tr>
+                    <td>Type of Audit</td>
+                    <td>Internal Infrastructure Vulnerability Assessment &amp; Penetration Testing (OpenVAS / GVM)</td>
+                </tr>
+                <tr>
+                    <td>Target Scope / Hosts</td>
+                    <td><code style="color: #0284c7;">{html.escape(host_list_str)}</code></td>
+                </tr>
+                <tr>
+                    <td>Assessment Execution Period</td>
+                    <td>{html.escape(start)} &mdash; {html.escape(end)}</td>
+                </tr>
+                <tr>
+                    <td>Security Tools Employed</td>
+                    <td>OpenVAS / Greenbone Community Feed (80,000+ NVTs), Nmap Port Scanner, CVSS v3.1 Engine</td>
+                </tr>
+                <tr>
+                    <td>Overall Security Posture</td>
+                    <td>
+                        <span style="background: {posture_color}; color: white; padding: 4px 10px; border-radius: 4px; font-weight: 800; font-size: 11px;">
+                            {posture_level}
+                        </span>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <div style="margin-top: 35px; border-top: 1px solid #e2e8f0; padding-top: 12px; font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between;">
+            <div>Confidential &mdash; For Internal Security Review Only</div>
+            <div>Generated for {html.escape(org_name)}</div>
+        </div>
+    </div>
+
+    <!-- ════════════════════════ TABLE OF CONTENTS & SCANNED ITEMS ════════════════════════ -->
+    <div class="page-break"></div>
+    <div class="report-header">
+        <div>Infrastructure VAPT // {html.escape(org_name)}</div>
+        <div>{html.escape(report_date)}</div>
+    </div>
+
+    <h2 class="section-heading">Table of Contents &amp; Scanned Contents Index</h2>
+    <div style="font-size: 12px; line-height: 1.8; color: #334155; margin-bottom: 25px;">
+        <div style="margin-bottom: 12px; padding: 12px 16px; background: #f8fafc; border-radius: 6px; border-left: 4px solid #0284c7;">
+            <div style="font-weight: 700; color: #0f172a; margin-bottom: 4px;"><a href="#sec-exec" style="color: #0f172a; text-decoration: none;">1. Executive Summary &amp; Security Posture</a></div>
+            <div style="font-weight: 700; color: #0f172a; margin-bottom: 4px;"><a href="#sec-methodology" style="color: #0f172a; text-decoration: none;">2. Scanning Methodology &amp; Tools Employed</a></div>
+            <div style="font-weight: 700; color: #0f172a; margin-bottom: 4px;"><a href="#sec-scope" style="color: #0f172a; text-decoration: none;">3. Assessment Scope &amp; Result Overview per Host</a></div>
+            <div style="font-weight: 700; color: #0f172a;"><a href="#sec-findings" style="color: #0f172a; text-decoration: none;">4. Detailed Vulnerability Observations &amp; Scanned Results</a></div>
+        </div>
+
+        {toc_hosts_html}
+
+        <div style="margin-top: 14px; padding: 12px 16px; background: #f8fafc; border-radius: 6px; border-left: 4px solid #0284c7;">
+            <div style="font-weight: 700; color: #0f172a; margin-bottom: 4px;"><a href="#sec-remediation" style="color: #0f172a; text-decoration: none;">5. Remediation Roadmap &amp; Best Practices</a></div>
+            <div style="font-weight: 700; color: #0f172a;"><a href="#sec-appendix" style="color: #0f172a; text-decoration: none;">6. Appendix &amp; Security Glossary</a></div>
+        </div>
+    </div>
+
+    <!-- ════════════════════════ EXECUTIVE SUMMARY ════════════════════════ -->
+    <div class="page-break"></div>
+    <div class="report-header">
+        <div>Infrastructure VAPT // {html.escape(org_name)}</div>
+        <div>{html.escape(report_date)}</div>
+    </div>
+
+    <h2 id="sec-exec" class="section-heading">1. Executive Summary &amp; Security Posture</h2>
+    <div style="font-size: 12px; line-height: 1.7; color: #334155; margin-bottom: 24px; text-align: justify;">
+        <p>
+            An internal infrastructure vulnerability assessment was performed against the designated scope (<strong>{html.escape(host_list_str)}</strong>) under task <strong>{html.escape(task)}</strong> for <strong>{html.escape(org_name)}</strong>. The objective was to discover reachable services, evaluate system hardening standards, identify unpatched Common Vulnerabilities and Exposures (CVEs), and assess overall infrastructure risk.
+        </p>
+        <div style="background: #f8fafc; border-left: 4px solid {posture_color}; padding: 14px 18px; border-radius: 0 8px 8px 0; margin: 16px 0;">
+            <strong style="color: #0f172a; font-size: 13px;">POSTURE ASSESSMENT: <span style="color: {posture_color};">{posture_level}</span></strong>
+            <p style="margin: 6px 0 0; color: #475569; font-size: 12px;">{posture_desc}</p>
+        </div>
+    </div>
+
+    <!-- KPI Cards -->
+    <div style="display: flex; gap: 12px; margin-bottom: 30px;">
+        <div class="kpi-card" style="background: #dc2626;">
+            <div class="kpi-number">{high_cnt}</div>
+            <div class="kpi-label">High Severity</div>
+        </div>
+        <div class="kpi-card" style="background: #ea580c;">
+            <div class="kpi-number">{med_cnt}</div>
+            <div class="kpi-label">Medium Severity</div>
+        </div>
+        <div class="kpi-card" style="background: #2563eb;">
+            <div class="kpi-number">{low_cnt}</div>
+            <div class="kpi-label">Low Severity</div>
+        </div>
+        <div class="kpi-card" style="background: #64748b;">
+            <div class="kpi-number">{log_cnt}</div>
+            <div class="kpi-label">Informational</div>
+        </div>
+        <div class="kpi-card" style="background: #0f172a;">
+            <div class="kpi-number">{total_vulns}</div>
+            <div class="kpi-label">Total Findings</div>
+        </div>
+    </div>
+
+    <!-- ════════════════════════ METHODOLOGY & TOOLS ════════════════════════ -->
+    <h2 id="sec-methodology" class="section-heading">2. Scanning Methodology &amp; Tools Employed</h2>
+    <div style="font-size: 12px; line-height: 1.7; color: #334155; text-align: justify;">
+        <p>
+            The audit utilized an industry-standard, multi-phase vulnerability assessment methodology adhering to <strong>NIST SP 800-115</strong> (Technical Guide to Information Security Testing and Assessment) and <strong>CVSS v3.1</strong> scoring metrics:
+        </p>
+        <table class="styled-table">
+            <thead>
+                <tr>
+                    <th style="width: 28%;">Tool / Module</th>
+                    <th style="width: 22%;">Version / Feed</th>
+                    <th>Functional Scope &amp; Audit Rationale</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>OpenVAS / GVM</strong></td>
+                    <td>Greenbone Community Feed (80k+ NVTs)</td>
+                    <td>Comprehensive network vulnerability scanner executing authenticated and unauthenticated Network Vulnerability Tests (NVTs) to discover CVEs, missing patches, and insecure service configurations.</td>
+                </tr>
+                <tr>
+                    <td><strong>Nmap Network Mapper</strong></td>
+                    <td>v7.94 Engine</td>
+                    <td>Performs active TCP/UDP host discovery, service fingerprinting, and port state analysis prior to deep vulnerability scanning.</td>
+                </tr>
+                <tr>
+                    <td><strong>CVSS v3.1 Engine</strong></td>
+                    <td>FIRST Standard Framework</td>
+                    <td>Provides standardized vulnerability severity scoring evaluating exploitability metrics (Attack Vector, Attack Complexity, Privileges Required) and impact (Confidentiality, Integrity, Availability).</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- ════════════════════════ RESULT OVERVIEW PER HOST ════════════════════════ -->
+    <div class="page-break"></div>
+    <div class="report-header">
+        <div>Infrastructure VAPT // {html.escape(org_name)}</div>
+        <div>{html.escape(report_date)}</div>
+    </div>
+
+    <h2 id="sec-scope" class="section-heading">3. Assessment Scope &amp; Result Overview per Host</h2>
+    <table class="styled-table">
+        <thead>
+            <tr>
+                <th>Target Host</th>
+                <th style="text-align: center;">High</th>
+                <th style="text-align: center;">Medium</th>
+                <th style="text-align: center;">Low</th>
+                <th style="text-align: center;">Info / Log</th>
+                <th style="text-align: center;">Total Findings</th>
+            </tr>
+        </thead>
+        <tbody>
+            {overview_rows_html}
+            <tr style="background: #f1f5f9; font-weight: 800; border-top: 2px solid #0f172a;">
+                <td>Total ({len(hosts)} Hosts)</td>
+                <td style="text-align: center; color: #dc2626;">{high_cnt}</td>
+                <td style="text-align: center; color: #ea580c;">{med_cnt}</td>
+                <td style="text-align: center; color: #2563eb;">{low_cnt}</td>
+                <td style="text-align: center; color: #64748b;">{log_cnt}</td>
+                <td style="text-align: center;">{total_vulns}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ════════════════════════ DETAILED FINDINGS ════════════════════════ -->
+    <div class="page-break"></div>
+    <div class="report-header">
+        <div>Infrastructure VAPT // {html.escape(org_name)}</div>
+        <div>{html.escape(report_date)}</div>
+    </div>
+
+    <h2 id="sec-findings" class="section-heading">4. Detailed Vulnerability Observations &amp; Scanned Results</h2>
+    {findings_html if findings_html else "<div style='padding: 30px; text-align: center; color: #16a34a; font-weight: 600;'>No vulnerabilities were identified across the audited assets.</div>"}
+
+    <!-- ════════════════════════ REMEDIATION & CONCLUSION ════════════════════════ -->
+    <div class="page-break"></div>
+    <div class="report-header">
+        <div>Infrastructure VAPT // {html.escape(org_name)}</div>
+        <div>{html.escape(report_date)}</div>
+    </div>
+
+    <h2 id="sec-remediation" class="section-heading">5. Remediation Roadmap &amp; Best Practices</h2>
+    <div style="font-size: 12px; line-height: 1.7; color: #334155; text-align: justify;">
+        <p>
+            Remediating the security observations identified during this audit requires a structured patch management and system hardening roadmap:
+        </p>
+        <table class="styled-table">
+            <thead>
+                <tr>
+                    <th style="width: 25%;">Severity Level</th>
+                    <th style="width: 25%;">Recommended SLA</th>
+                    <th>Action Plan</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><span style="background: #dc2626; color: white; padding: 2px 8px; border-radius: 3px; font-weight: 700;">HIGH / CRITICAL</span></td>
+                    <td><strong>Within 48 &mdash; 96 Hours</strong></td>
+                    <td>Immediately apply vendor patches, disable vulnerable services, or implement temporary firewall/network isolation.</td>
+                </tr>
+                <tr>
+                    <td><span style="background: #ea580c; color: white; padding: 2px 8px; border-radius: 3px; font-weight: 700;">MEDIUM</span></td>
+                    <td><strong>Within 10 Days</strong></td>
+                    <td>Review service configuration, upgrade dependent software packages, and enforce strong cryptographic cipher suites.</td>
+                </tr>
+                <tr>
+                    <td><span style="background: #2563eb; color: white; padding: 2px 8px; border-radius: 3px; font-weight: 700;">LOW</span></td>
+                    <td><strong>Within 15 &mdash; 30 Days</strong></td>
+                    <td>Address security hygiene recommendations, disable obsolete banners, and schedule regular maintenance windows.</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h2 id="sec-appendix" class="section-heading" style="margin-top: 30px;">6. Appendix &amp; Security Glossary</h2>
+    <table class="styled-table" style="font-size: 11px;">
+        <tr><td style="width: 25%; font-weight: bold; background: #f8fafc;">VAPT</td><td>Vulnerability Assessment and Penetration Testing &mdash; A structured audit methodology identifying and assessing vulnerabilities in IT assets.</td></tr>
+        <tr><td style="font-weight: bold; background: #f8fafc;">NVT</td><td>Network Vulnerability Test &mdash; A specialized scanning script in OpenVAS/GVM designed to detect a specific CVE, configuration flaw, or exploit signature.</td></tr>
+        <tr><td style="font-weight: bold; background: #f8fafc;">CVSS v3.1</td><td>Common Vulnerability Scoring System &mdash; Standardized numerical framework assessing vulnerability severity from 0.0 to 10.0.</td></tr>
+        <tr><td style="font-weight: bold; background: #f8fafc;">CVE</td><td>Common Vulnerabilities and Exposures &mdash; Public dictionary of standardized identifiers for known software vulnerabilities.</td></tr>
+        <tr><td style="font-weight: bold; background: #f8fafc;">QoD</td><td>Quality of Detection &mdash; Greenbone metric (0-100%) expressing confidence in the vulnerability detection accuracy.</td></tr>
+    </table>
+
 </body>
-</html>"""
-
-
+</html>
+"""
 
     def _cache_get(self, key: str):
         entry = self._cache.get(key)
