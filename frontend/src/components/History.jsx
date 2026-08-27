@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Calendar, Shield, Trash2, ArrowRight, ExternalLink, RefreshCw, Eye, X, FileText, Download, Loader2 } from 'lucide-react';
+import { Calendar, Shield, Trash2, ArrowRight, ExternalLink, RefreshCw, Eye, X, FileText, Download, Loader2, Search, Users } from 'lucide-react';
 import { DonutChart, BarChart, LineChart, MultiLineChart } from './SvgCharts';
 import PortMatrixView from './PortMatrixView';
 import { triggerFileDownload } from '../utils/downloadHelper';
@@ -512,60 +512,76 @@ export default function History({ apiBase }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
       
       {/* Search and Filters */}
-      <div className="card" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', padding: '1rem', flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-          {['all', 'nmap', 'nuclei', 'nikto', 'gobuster', 'zap', 'sqlmap', 'ffuf'].map(tool => (
+      {/* Search and Filters */}
+      <div className="card" style={{ padding: '12px 16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+          {/* Tool Selector Pills */}
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' }}>
+            {['all', 'nmap', 'nuclei', 'nikto', 'gobuster', 'zap', 'sqlmap', 'ffuf'].map(tool => (
+              <button
+                key={tool}
+                onClick={() => setSelectedTool(tool)}
+                className={`btn btn-sm ${selectedTool === tool ? 'btn-primary' : 'btn-secondary'}`}
+                style={{ textTransform: 'uppercase', fontSize: '11px', padding: '4px 10px', height: '32px' }}
+              >
+                {tool}
+              </button>
+            ))}
+          </div>
+
+          {/* Target Group & Host Search Controls */}
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            {targetGroups.length > 0 && (
+              <div style={{ position: 'relative', minWidth: '170px' }}>
+                <select
+                  className="form-select"
+                  value={selectedGroupId}
+                  onChange={(e) => setSelectedGroupId(e.target.value)}
+                  style={{
+                    height: '32px',
+                    fontSize: '12px',
+                    paddingRight: '28px',
+                    background: 'var(--bg-surface, #ffffff)',
+                    border: '1px solid var(--border-default, #cbd5e1)',
+                    color: 'var(--text-primary, #0f172a)'
+                  }}
+                >
+                  <option value="">All Target Groups</option>
+                  {targetGroups.map(g => (
+                    <option key={g.id} value={g.id}>🟣 {g.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div style={{ position: 'relative', width: '200px' }}>
+              <Search size={13} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)', pointerEvents: 'none' }} />
+              <input
+                type="text"
+                className="form-input"
+                placeholder="Filter by target host..."
+                value={targetFilter}
+                onChange={(e) => setTargetFilter(e.target.value)}
+                style={{
+                  height: '32px',
+                  fontSize: '12px',
+                  paddingLeft: '30px',
+                  background: 'var(--bg-surface, #ffffff)',
+                  border: '1px solid var(--border-default, #cbd5e1)',
+                  color: 'var(--text-primary, #0f172a)'
+                }}
+              />
+            </div>
+
             <button
-              key={tool}
-              onClick={() => setSelectedTool(tool)}
-              className={`btn ${selectedTool === tool ? 'btn-primary' : 'btn-secondary'}`}
-              style={{ textTransform: 'uppercase', padding: '0.4rem 0.8rem', fontSize: '0.75rem' }}
+              className="btn btn-secondary btn-sm"
+              onClick={fetchHistoryAndTrends}
+              style={{ height: '32px', padding: '0 10px', display: 'flex', alignItems: 'center', gap: '4px' }}
+              title="Refresh History"
             >
-              {tool}
+              <RefreshCw size={13} className={loading ? 'spin' : ''} />
             </button>
-          ))}
-        </div>
-
-        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          {targetGroups.length > 0 && (
-            <select
-              className="form-select"
-              value={selectedGroupId}
-              onChange={(e) => setSelectedGroupId(e.target.value)}
-              style={{
-                padding: '0.4rem 0.75rem',
-                borderRadius: '6px',
-                border: '1px solid var(--border-subtle)',
-                background: 'rgba(0,0,0,0.2)',
-                color: 'var(--text-primary)',
-                fontSize: '0.85rem',
-                height: '34px'
-              }}
-            >
-              <option value="">All Target Groups</option>
-              {targetGroups.map(g => (
-                <option key={g.id} value={g.id}>🟣 {g.name}</option>
-              ))}
-            </select>
-          )}
-
-          <input
-            type="text"
-            placeholder="Filter by target host..."
-            value={targetFilter}
-            onChange={(e) => setTargetFilter(e.target.value)}
-            style={{
-              padding: '0.4rem 0.75rem',
-              borderRadius: '6px',
-              border: '1px solid var(--border-subtle)',
-              background: 'rgba(0,0,0,0.2)',
-              color: 'var(--text-primary)',
-              fontSize: '0.85rem'
-            }}
-          />
-          <button className="btn btn-secondary" onClick={fetchHistoryAndTrends} style={{ padding: '0.4rem 0.6rem' }} title="Refresh History">
-            <RefreshCw size={14} className={loading ? 'spin' : ''} />
-          </button>
+          </div>
         </div>
       </div>
 
